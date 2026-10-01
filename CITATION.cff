@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use A-LEAF in your work, please cite it as below."
+title: "Argonne Large-Scale Electricity Analysis Framework (A-LEAF)"
+abstract: >-
+  A-LEAF is an open-source Julia framework for power system capacity
+  expansion, operations and resource adequacy modeling.
+type: software
+authors:
+  - family-names: Kwon
+    given-names: Jonghwan
+    email: kwonj@anl.gov
+    affiliation: Argonne National Laboratory
+  - family-names: Levin
+    given-names: Todd
+    email: tlevin@anl.gov
+    affiliation: Argonne National Laboratory
+  - family-names: Mann
+    given-names: Neal
+    email: wmann@anl.gov
+    affiliation: Argonne National Laboratory
+repository-code: "https://github.com/argonne-aleaf/a-leaf"
+url: "https://www.anl.gov/esia/a-leaf"
+license: BSD-3-Clause
+version: 1.0.0
+date-released: 2026-09-29
+keywords:
+  - power systems
+  - capacity expansion
+  - resource adequacy
+  - energy modeling
+  - Julia

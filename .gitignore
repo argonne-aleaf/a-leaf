@@ -1,0 +1,18 @@
+_*/
+.*/
+*.png
+*.pyc
+*.lp
+~*
+
+output/*
+!output/.gitkeep
+
+# modeling-test harness (local pre-release tooling; not part of the release)
+tests/
+
+.DS_Store
+
+# per-clone GPU environments
+env-cuopt/
+env-madnlp/
