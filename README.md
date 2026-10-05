@@ -166,6 +166,9 @@ If you use A-LEAF in your work, please cite it. GitHub shows the citation under 
 ## Contact
 Questions, bug reports, and feature requests are welcome as [GitHub issues](https://github.com/argonne-aleaf/a-leaf/issues). For other inquiries, contact Jonghwan Kwon ([kwonj@anl.gov](mailto:kwonj@anl.gov)) or Todd Levin ([tlevin@anl.gov](mailto:tlevin@anl.gov)).
 
+## Acknowledgments
+Development of A-LEAF has been supported by the U.S. Department of Energy Office of Electricity and Office of Critical Minerals and Energy Innovation.
+
 ## License
 A-LEAF, including the input data distributed under `data/`, is released under the BSD 3-Clause license of UChicago Argonne, LLC. See [LICENSE](LICENSE).
 
