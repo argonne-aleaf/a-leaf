@@ -131,6 +131,9 @@ function generate_outage_samples(am_ref, am_setting, simulation_list, reference_
         # See generate_outage_scenarios: ceiling division keeps all chunks in the
         # @sync block; empty chunks (more workers than scenarios) are skipped.
         num_scenario_for_single_run = max(1, cld(num_risk_scenario, num_risk_scenario_segment))
+        if lowercase(string(get(RA_setting, "logging_level_value", "simple"))) == "detailed"
+            @aleaf_info "[ALEAF RA Model]: dispatch plan | $(num_risk_scenario) scenarios -> $(num_risk_scenario_segment) segments x ~$(num_scenario_for_single_run) scenarios each over $(length(workers())) workers"
+        end
 
         for seg_idx in 1:num_risk_scenario_segment
             temp_outage_scenario_report[seg_idx] = Dict{Int64, Any}()
@@ -202,6 +205,111 @@ function generate_outage_samples(am_ref, am_setting, simulation_list, reference_
     return outage_scenario_report
 end
 
+# Distributed disk path: sample every scenario segment on workers, each writing ONE coarse
+# per-segment JLD2 file (via _sample_and_write_segment!) holding all day-groups' RAW (uncoupled)
+# dense packs. No outage matrix crosses the wire; the master reads these back in RA.jl's
+# _reconstitute_risk_scenario_dict_from_partials, then runs the original couple/filter/cache flow.
+# Returns seg_list::Vector{Int} (the dispatched segments). The in-memory generate_outage_samples
+# stays the entry for the non-distributed path and any other caller.
+function generate_outage_samples_to_cache!(am_ref, am_setting, simulation_list, reference_temp, num_risk_scenario, RA_setting, partials_dir; output_option="Status")
+    @aleaf_info "[ALEAF RA Model]: Perfrom Outage Sampling Using $(length(workers())) Workers (partials path)"
+    mkpath(partials_dir)
+
+    # Ship ONLY what the sampler reads. The full am_ref holds ~209 per-day-group networks (~7 GB);
+    # calculate_and_filter_outage_rate touches only network 0 and only these 6 keys (~300 MB,
+    # temperatureData-dominated). Shipping the whole ref to every worker was the ~17-min sampling
+    # stall (serialization-bound, not the result transfer). The slim ref preserves the am_ref[:nw][0]
+    # access shape so the sampler is unchanged and outputs stay byte-identical.
+    _nw0 = am_ref[:nw][0]
+    slim_ref = Dict{Symbol,Any}(:nw => Dict{Int,Any}(0 => Dict{Symbol,Any}(
+        :RA_gen_index    => _nw0[:RA_gen_index],
+        :bus             => _nw0[:bus],
+        :regressionAD    => _nw0[:regressionAD],
+        :regressionDD    => _nw0[:regressionDD],
+        :repday_groups   => _nw0[:repday_groups],
+        :temperatureData => _nw0[:temperatureData],
+    )))
+
+    num_risk_scenario_segment = length(workers())
+    # See generate_outage_scenarios: ceiling division keeps all chunks in the
+    # @sync block; empty chunks (more workers than scenarios) are skipped.
+    num_scenario_for_single_run = max(1, cld(num_risk_scenario, num_risk_scenario_segment))
+    if lowercase(string(get(RA_setting, "logging_level_value", "simple"))) == "detailed"
+        @aleaf_info "[ALEAF RA Model]: dispatch plan | $(num_risk_scenario) scenarios -> $(num_risk_scenario_segment) segments x ~$(num_scenario_for_single_run) scenarios each over $(length(workers())) workers"
+    end
+
+    seg_list = Int[]
+    collect_lock = ReentrantLock()
+
+    np = nprocs()
+    i = 1
+    nextidx() = (idx=i; i+=1; idx)
+
+    @sync begin
+        for p in workers()
+            if p != myid() || np == 1
+                @async begin
+                    while true
+                        seg_idx = nextidx()
+                        if seg_idx > num_risk_scenario_segment
+                            break
+                        end
+
+                        lo = num_scenario_for_single_run*(seg_idx-1) + 1
+                        hi = min(num_scenario_for_single_run*seg_idx, num_risk_scenario)
+                        if lo > hi
+                            continue
+                        end
+                        risk_scenario_list = [i for i in lo:hi]
+
+                        remotecall_fetch(_sample_and_write_segment!, p, slim_ref, am_setting, simulation_list, reference_temp, risk_scenario_list, RA_setting, seg_idx, partials_dir; output_option)
+                        lock(collect_lock) do
+                            push!(seg_list, seg_idx)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    sort!(seg_list)
+    return seg_list
+end
+
+# Sample one scenario segment on a worker and write it to ONE coarse JLD2 file holding every
+# day-group's RAW dense pack (no coupling here: the master couples once in the original flow).
+# Returns only metadata (no matrices cross the wire). seg_idx is the sampler's seed_value so the
+# RNG stream is identical to the current distributed path.
+function _sample_and_write_segment!(am_ref, am_setting, simulation_list, reference_temp, risk_scenario_list, RA_setting, seg_idx, partials_dir; output_option="Status")
+    mkpath(partials_dir)
+
+    # Same args/seed (seed_value=seg_idx) and apply_filter=false as the current distributed call,
+    # so the sampled outage_scenario is byte-identical.
+    outage_scenario, _ = calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, reference_temp, risk_scenario_list, RA_setting, seg_idx; output_option, apply_filter=false)
+
+    # Pack every day-group (dense) and write ONE Lustre file for this segment (not one per day).
+    risk_ids_by_day = Dict{Int, Vector{Int}}()
+    packed = Dict{Int, Tuple{Any, Dict{Int, Int}}}()
+    day_group_ids = sort(Int.(collect(keys(outage_scenario))))
+    for dg in day_group_ids
+        scenarios, risk_id_to_idx, valid_risk_ids = _pack_day_group(outage_scenario[dg])
+        packed[dg] = (scenarios, risk_id_to_idx)
+        risk_ids_by_day[dg] = sort(Int.(valid_risk_ids))
+    end
+
+    file_path = joinpath(partials_dir, "seg_$(seg_idx).jld2")
+    _atomic_jld2_write!(file_path) do f
+        f["day_group_ids"] = day_group_ids
+        for dg in day_group_ids
+            scenarios, risk_id_to_idx = packed[dg]
+            f["scenarios_$(dg)"] = scenarios
+            f["ridx_$(dg)"] = risk_id_to_idx
+        end
+    end
+
+    return (seg_idx, true, risk_ids_by_day)
+end
+
 
 function calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, reference_temp, risk_scenario_list, RA_setting, seed_value=1; output_option="Status", apply_filter::Bool=true)
     
@@ -246,18 +354,42 @@ function calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, r
         end
     end
 
+    # Precompute once per call (temperature is scenario-independent). The previous
+    # implementation called filter(:Day_ID => in(day_list), temperatureData) INSIDE the
+    # per-bus loop, scanning the full 8760xNregions DataFrame and allocating a fresh slice
+    # for every bus, every day group, on every worker -> billions of cell copies and GC
+    # thrash. Instead: build a Day_ID -> row-index map once, then accumulate each bus's
+    # aggregated-region columns directly (no per-bus DataFrame materialization).
+    temperatureData = am_ref[:nw][0][:temperatureData]
+    day_id_to_rows = Dict{Int, Vector{Int}}()
+    for (r, d) in enumerate(temperatureData.Day_ID)
+        push!(get!(day_id_to_rows, Int(d), Int[]), r)
+    end
+
     temperature_cache = Dict{Int, Matrix{Float32}}()
     get_local_average_temperature(day_group_id) = get!(temperature_cache, day_group_id) do
         start_day = am_ref[:nw][0][:repday_groups][day_group_id]["Start_Day_Id"]
         end_day = am_ref[:nw][0][:repday_groups][day_group_id]["End_Day_Id"]
-        day_list = [i for i in start_day:end_day]
         num_hours = (end_day - start_day + 1) * 24
 
-        temperatureData = am_ref[:nw][0][:temperatureData]
+        # Row indices for this day group (single lookup; robust to row ordering).
+        rows = Int[]
+        for d in start_day:end_day
+            append!(rows, day_id_to_rows[d])
+        end
+
         local_average_temperature = zeros(Float32, num_hours, length(am_ref[:nw][0][:bus]))
         for bus_idx in keys(am_ref[:nw][0][:bus])
-            local_temperature = filter(:Day_ID => in(day_list), temperatureData)[:, am_ref[:nw][0][:bus][bus_idx]["aggregation_info"]["aggregated_regions_bus_i"]]
-            local_average_temperature[:, bus_idx] = [mean(c) for c in eachrow(local_temperature)]
+            region_cols = am_ref[:nw][0][:bus][bus_idx]["aggregation_info"]["aggregated_regions_bus_i"]
+            n_regions = length(region_cols)
+            acc = zeros(Float32, num_hours)
+            for c in region_cols
+                col = temperatureData[!, c]   # stored column vector, no copy
+                @inbounds for (h, r) in enumerate(rows)
+                    acc[h] += col[r]
+                end
+            end
+            local_average_temperature[:, bus_idx] = acc ./ max(1, n_regions)
         end
         local_average_temperature
     end
@@ -308,7 +440,7 @@ function calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, r
                     # MTTR must be in hours.
                     mttr_hours = get(RA_setting, "repair_time_average_hours", 32)
                     mttr_hours = max(mttr_hours, 1.0) # avoid divide-by-zero or invalid probabilities
-                    
+
                     for t in 1:num_hours
                         # rateDD = P(stay down) per hour, geometric repair
                         rateDD[t] = 1 - (1 / mttr_hours)
@@ -324,7 +456,7 @@ function calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, r
                 if typeof(UnitprobabilityType) == String
 
                     UnitprobabilityTypeDD = string(UnitprobabilityType, "DD")
-                    
+
                     if RA_setting["repair_time_bound"] == "average"
                         max_repair_hours = regressionDD[:, UnitprobabilityTypeDD][7]    #repair_time_average
                     elseif RA_setting["repair_time_bound"] == "95 percentile"
@@ -405,9 +537,10 @@ function calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, r
                     end
 
                 outage_scenario[day_group_id][sce_id][:, gen_idx] = unit_status
-                
+
             end
         end
+
     end
 
     # Seed the recalculation pass with the last warm-start day's outage state.
@@ -579,17 +712,17 @@ function calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, r
                     end
 
                 outage_scenario[day_group_id][sce_id][:, gen_idx] = unit_status
-                
+
             end
         end
-        
+
     end
 
     if apply_filter == false
         return outage_scenario, filtered_outage_scenario_list
     end
 
-    # filter risk scenarios 
+    # filter risk scenarios
     for day_group_idx in eachindex(simulation_list)
         
         if RA_setting["risk_filtering_flag"] == false
@@ -647,8 +780,6 @@ function calculate_and_filter_outage_rate(am_ref, am_setting, simulation_list, r
 
     end
 
-    
-
     return outage_scenario, filtered_outage_scenario_list
 end
 
@@ -695,18 +826,37 @@ function calculate_outage_rate_of_single_unit(am_ref, simulation_list, gen_info,
 
     num_gens = 1
 
+    # See calculate_and_filter_outage_rate: hoist the Day_ID filter out of the per-bus loop
+    # (prebuilt row map + direct column accumulation) to avoid per-bus full-DataFrame scans.
+    temperatureData = am_ref[:temperatureData]
+    day_id_to_rows = Dict{Int, Vector{Int}}()
+    for (r, d) in enumerate(temperatureData.Day_ID)
+        push!(get!(day_id_to_rows, Int(d), Int[]), r)
+    end
+
     temperature_cache = Dict{Int, Matrix{Float32}}()
     get_local_average_temperature(day_group_id) = get!(temperature_cache, day_group_id) do
         start_day = am_ref[:repday_groups][day_group_id]["Start_Day_Id"]
         end_day = am_ref[:repday_groups][day_group_id]["End_Day_Id"]
-        day_list = [i for i in start_day:end_day]
         num_hours = (end_day - start_day + 1) * 24
 
-        temperatureData = am_ref[:temperatureData]
+        rows = Int[]
+        for d in start_day:end_day
+            append!(rows, day_id_to_rows[d])
+        end
+
         local_average_temperature = zeros(Float32, num_hours, length(am_ref[:bus]))
         for bus_idx in keys(am_ref[:bus])
-            local_temperature = filter(:Day_ID => in(day_list), temperatureData)[:, am_ref[:bus][bus_idx]["aggregation_info"]["aggregated_regions_bus_i"]]
-            local_average_temperature[:, bus_idx] = [mean(c) for c in eachrow(local_temperature)]
+            region_cols = am_ref[:bus][bus_idx]["aggregation_info"]["aggregated_regions_bus_i"]
+            n_regions = length(region_cols)
+            acc = zeros(Float32, num_hours)
+            for c in region_cols
+                col = temperatureData[!, c]   # stored column vector, no copy
+                @inbounds for (h, r) in enumerate(rows)
+                    acc[h] += col[r]
+                end
+            end
+            local_average_temperature[:, bus_idx] = acc ./ max(1, n_regions)
         end
         local_average_temperature
     end

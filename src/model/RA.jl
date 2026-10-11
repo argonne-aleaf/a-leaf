@@ -101,13 +101,12 @@ function execute_ALEAF_RA_model(ALEAF_setting, case_id; RA_input::Dict{String,<:
     risk_scenario_dict, RA_Info["RA_reference_risk_data"]["filtered_joint_scenario_map"] = generate_and_filter_risk_scenarios(RA_ALEAF_setting, RA_Info, ALEAF_model_instance; RA_input)
     @aleaf_info "[ALEAF RA Model]: Risk Sampling Completed"
 
-    output_path = ALEAF_model_instance.ref[:nw][0][:output_path]
-    outage_cache_path = joinpath(output_path, "RA_outage_cache")
-    _write_risk_scenario_cache!(outage_cache_path, risk_scenario_dict; prefix="day")
-    RA_Info["setting"]["outage_cache_path"] = outage_cache_path
-    RA_Info["setting"]["outage_cache_format"] = "jld2"
-    @aleaf_info "[ALEAF RA Model]: Outage scenario cache written to $outage_cache_path"
-    
+    # Cache is written inside generate_and_filter_risk_scenarios (which also set these settings).
+    outage_cache_path = RA_Info["setting"]["outage_cache_path"]
+    if lowercase(string(get(RA_Info["setting"], "logging_level_value", "simple"))) == "detailed"
+        @aleaf_info "[ALEAF RA Model]: Outage scenario cache available at $outage_cache_path"
+    end
+
     total_sce = 0
     total_num_days = 0
     for day_idx in keys(RA_Info["RA_reference_risk_data"]["filtered_joint_scenario_map"])
@@ -321,16 +320,24 @@ function execute_ALEAF_RA_model(ALEAF_setting, case_id; RA_input::Dict{String,<:
         if haskey(RA_Info["setting"], "reference_cache_path")
             push!(cache_paths, string(RA_Info["setting"]["reference_cache_path"]))
         end
+        # am_ref disk-broadcast cache (written by _push_am_ref_to_workers!): sibling of the others.
+        push!(cache_paths, joinpath(string(ALEAF_model_instance.ref[:nw][0][:output_path]), "RA_amref_cache"))
+        # repday shard cache (written by _write_repday_shards!): sibling of the others.
+        push!(cache_paths, joinpath(string(ALEAF_model_instance.ref[:nw][0][:output_path]), "RA_repday_cache"))
+        # renewable shard cache (written by _write_renewable_shards!): sibling of the others.
+        push!(cache_paths, joinpath(string(ALEAF_model_instance.ref[:nw][0][:output_path]), "RA_renewable_cache"))
         for cache_path in unique(cache_paths)
             if ispath(cache_path)
                 try
-                    rm(cache_path; recursive=true, force=true)                    
+                    rm(cache_path; recursive=true, force=true)
                 catch err
                     @aleaf_warn "[ALEAF RA Model]: Failed to remove RA cache path: $cache_path | $(sprint(showerror, err))"
                 end
             end
         end
-        @aleaf_info "[ALEAF RA Model]: Removed RA cache"
+        if lowercase(string(get(RA_Info["setting"], "logging_level_value", "simple"))) == "detailed"
+            @aleaf_info "[ALEAF RA Model]: Removed RA cache"
+        end
     end
 
     @aleaf_info "[ALEAF RA Model]: Completed"
@@ -483,7 +490,14 @@ function couple_hybrid_outages!(risk_scenario_dict, ref)
 end
 
 
-function generate_and_filter_risk_scenarios(ALEAF_setting, RA_Info, ALEAF_model_instance; RA_input::Dict{String,<:Any} = Dict{String,Any}())
+# Returns (risk_scenario_dict, filtered_joint_scenario_map) and is responsible for writing the
+# per-day outage cache itself (_write_risk_scenario_cache!) so the ED loader can find it. It sets
+# RA_Info["setting"]["outage_cache_path"] / ["outage_cache_format"]. Three ways of OBTAINING the
+# dict converge (pre-determined / distributed coarse-partials / in-memory), after which coupling,
+# filtering, and caching are shared; the returned dict is always the real populated dict.
+# force_in_memory=true keeps sampling in-memory even when distributed_run_flag is set (used by
+# callers that must serialize the dict, e.g. get_gen_outage_data with save_output).
+function generate_and_filter_risk_scenarios(ALEAF_setting, RA_Info, ALEAF_model_instance; RA_input::Dict{String,<:Any} = Dict{String,Any}(), force_in_memory::Bool=false)
 
     # read temperature data
     data_location = ALEAF_setting["data_location"]
@@ -508,16 +522,43 @@ function generate_and_filter_risk_scenarios(ALEAF_setting, RA_Info, ALEAF_model_
     build_ra_renewable_daygroup_cache!(RA_Info, ALEAF_model_instance)   # map renewable scenario timeseries to daygroups
     build_ra_joint_scenario_map!(RA_Info, simulation_list)
 
-    # get risk scenarios
+    # Cache location is resolved here (before sampling) so both paths set the same settings
+    # and the distributed path can stream partials to disk.
+    outage_cache_path = joinpath(ALEAF_model_instance.ref[:nw][0][:output_path], "RA_outage_cache")
+    partials_dir = joinpath(outage_cache_path, "partials")
+    RA_Info["setting"]["outage_cache_path"] = outage_cache_path
+    RA_Info["setting"]["outage_cache_format"] = "jld2"
+
+    distributed_disk_path = (RA_Info["setting"]["distributed_run_flag"] == true) &&
+                            !haskey(RA_input, "risk_scenario_dict") &&
+                            !force_in_memory
+
+    # Three ways to OBTAIN risk_scenario_dict; all converge to the same coupling/filter/cache flow.
     if haskey(RA_input, "risk_scenario_dict")
-        risk_scenario_dict = RA_input["risk_scenario_dict"]        
+        risk_scenario_dict = RA_input["risk_scenario_dict"]
         @aleaf_info "[ALEAF RA Model]: Using pre-determined risk sample data"
+    elseif distributed_disk_path
+        # Distributed: workers sample and each writes ONE coarse per-segment partial (raw, uncoupled);
+        # the master reads them back into the real in-memory dict, then runs the original flow below.
+        seg_list = generate_outage_samples_to_cache!(
+            ALEAF_model_instance.ref, ALEAF_model_instance.setting, simulation_list,
+            reference_temp, RA_Info["setting"]["num_risk_scenario"], RA_Info["setting"],
+            partials_dir; output_option="Status")
+        if lowercase(string(get(RA_Info["setting"], "logging_level_value", "simple"))) == "detailed"
+            @aleaf_info "[ALEAF RA Model]: Outage partials written for $(length(seg_list)) segments"
+        end
+        risk_scenario_dict = _reconstitute_risk_scenario_dict_from_partials(partials_dir, seg_list, simulation_list)
+        rm(partials_dir; recursive=true, force=true)
+        if lowercase(string(get(RA_Info["setting"], "logging_level_value", "simple"))) == "detailed"
+            @aleaf_info "[ALEAF RA Model]: Outage samples reconstituted from partials"
+        end
     else
         risk_scenario_dict = generate_outage_samples(ALEAF_model_instance.ref, ALEAF_model_instance.setting, simulation_list, reference_temp, RA_Info["setting"]["num_risk_scenario"], RA_Info["setting"]; output_option="Status")
     end
 
     # Hybrid assets are one unit for outages: either component down takes the whole asset down.
     # Must run before filtering and caching so every downstream consumer sees the coupled matrices.
+    # Applied exactly once here for every path (workers write RAW samples, never couple).
     couple_hybrid_outages!(risk_scenario_dict, ALEAF_model_instance.ref)
 
     # filter risk scenarios
@@ -531,6 +572,14 @@ function generate_and_filter_risk_scenarios(ALEAF_setting, RA_Info, ALEAF_model_
         @aleaf_info "[ALEAF RA Model]: Using pre-determined risk filtering data"
     else
         filtered_joint_scenario_map = filter_generated_outage_scenarios!(RA_Info, ALEAF_model_instance.ref, ALEAF_model_instance.setting, simulation_list, RA_Info["setting"], risk_scenario_dict)
+    end
+
+    # Write the canonical per-day cache so the ED loads from disk on all in-memory paths too.
+    risk_scenario_dict_int64 = risk_scenario_dict isa Dict{Int64, Any} ? risk_scenario_dict :
+        Dict{Int64, Any}(Int64(k) => v for (k, v) in risk_scenario_dict)
+    _write_risk_scenario_cache!(outage_cache_path, risk_scenario_dict_int64; prefix="day")
+    if lowercase(string(get(RA_Info["setting"], "logging_level_value", "simple"))) == "detailed"
+        @aleaf_info "[ALEAF RA Model]: Outage scenario cache written to $outage_cache_path"
     end
 
     return risk_scenario_dict, filtered_joint_scenario_map
@@ -575,7 +624,6 @@ function filter_generated_outage_scenarios!(RA_Info, am_reference_data, am_setti
 
     return filtered_joint_scenario_map
 end
-
 
 function filter_risk_scenarios(am_reference_data, am_setting_data, day_group_id, RA_setting, risk_scenario_dict)
 
@@ -1710,13 +1758,29 @@ end
 #= RA via ED: filter to critical risk scenarios, run reserve-free ED (respecting
    topology/power flow) on them, and derive metrics from the load-shedding results. =#
 
-function execute_RA_model_with_ED!(RA_Info, ALEAF_model_instance, risk_scenario_dict; report_log=true) 
-    
+function execute_RA_model_with_ED!(RA_Info, ALEAF_model_instance, risk_scenario_dict; report_log=true)
+
+    # Compact mode streams each returning scenario into metric accumulators and discards its
+    # heavy per-scenario detail immediately, capping master memory at O(one day-group).
+    # Detailed mode keeps RA_solutions for the output JSON, so it uses the legacy pass.
+    output_verbose_level = lowercase(string(get(RA_Info["setting"], "output_verbose_level", "compact")))
+    use_streaming = output_verbose_level != "detailed"
+
+    metric_ctx = nothing
+    metric_acc = nothing
+    if use_streaming
+        metric_ctx = _ra_build_metric_context(ALEAF_model_instance, RA_Info)
+        metric_acc = _ra_init_metric_accumulator(metric_ctx)
+        RA_Info["RA_metric_context"] = metric_ctx
+        RA_Info["RA_metric_accumulator"] = metric_acc
+    end
+
     # Run RA model in parallel
-    RA_Info["RA_solutions"] = perform_ED_analysis_for_RA(ALEAF_model_instance.ref, ALEAF_model_instance.setting, RA_Info["setting"], risk_scenario_dict, RA_Info["RA_reference_risk_data"]["filtered_joint_scenario_map"]; report_log=report_log)
+    RA_Info["RA_solutions"] = perform_ED_analysis_for_RA(ALEAF_model_instance.ref, ALEAF_model_instance.setting, RA_Info["setting"], risk_scenario_dict, RA_Info["RA_reference_risk_data"]["filtered_joint_scenario_map"]; report_log=report_log, metric_ctx=metric_ctx, metric_acc=metric_acc, discard_scenario_detail=use_streaming)
     if report_log @aleaf_info "[ALEAF RA Model]: ED Analysis: Completed." end
 
-    # Calculate RA metrics (EUE, LOLE)
+    # Calculate RA metrics (EUE, LOLE). Streaming path finalizes from accumulators; the
+    # legacy RA_solutions-based pass runs when no accumulator is present (detailed mode / ELCC).
     RA_Info = calculate_risk_metrics_ED!(ALEAF_model_instance, RA_Info)
     if report_log @aleaf_info "[ALEAF RA Model]: RA Metrics Calculation: Completed." end
 
@@ -2373,6 +2437,20 @@ function _set_ra_reference_cache_path!(reference_cache_path::String)
     return nothing
 end
 
+function _set_ra_repday_cache_path!(repday_cache_path::String)
+    _RA_WORKER_CACHE[:repday_cache_path] = repday_cache_path
+    _RA_WORKER_CACHE[:repday_day_cache] = Dict{Int, Any}()
+    _RA_WORKER_CACHE[:repday_day_cache_order] = Int[]
+    return nothing
+end
+
+function _set_ra_renewable_cache_path!(renewable_cache_path::String)
+    _RA_WORKER_CACHE[:renewable_cache_path] = renewable_cache_path
+    _RA_WORKER_CACHE[:renewable_day_cache] = Dict{Int, Any}()
+    _RA_WORKER_CACHE[:renewable_day_cache_order] = Int[]
+    return nothing
+end
+
 function _atomic_jld2_write!(writer_fn::Function, file_path::String)
     dir_path = dirname(file_path)
     mkpath(dir_path)
@@ -2391,6 +2469,240 @@ function _atomic_jld2_write!(writer_fn::Function, file_path::String)
     return nothing
 end
 
+# Atomic serialize-to-disk (temp + mv), mirroring _atomic_jld2_write! but for a raw Serialization blob.
+function _atomic_serialize_write!(obj, file_path::String)
+    dir_path = dirname(file_path)
+    mkpath(dir_path)
+    tmp_path = joinpath(dir_path, "." * basename(file_path) * ".tmp." * string(myid()) * "." * randstring(8))
+    try
+        open(tmp_path, "w") do io
+            serialize(io, obj)
+        end
+        mv(tmp_path, file_path; force=true)
+    catch err
+        isfile(tmp_path) && rm(tmp_path; force=true)
+        rethrow(err)
+    end
+    return nothing
+end
+
+# Build a push copy of am_ref with the repday "data" subtree stripped (workers lazily load those
+# shards from disk) AND the six master-only/regenerated/duplicate nw0 keys below dropped. Surgical
+# shallow-copy-down so no other key is lost and the master's full am_ref is never mutated; per-bus nw
+# entries stay as the original references (untouched).
+# The dropped keys are safe on the worker solve path: :vre_aggregated_data_zdt/:vre_zdt_index are
+# rebuilt fresh in _build_ra_local_reference_for_scenario; the other four are master-only (not read
+# on workers).
+const _RA_PUSH_DROP_NW0_KEYS = (:temperatureData, :time_series_data, :regressionAD, :regressionDD, :vre_aggregated_data_zdt, :vre_zdt_index)
+function _build_light_am_ref_for_push(am_reference_data)
+    light = copy(am_reference_data)
+    light[:nw] = copy(am_reference_data[:nw])
+    light_nw0 = copy(am_reference_data[:nw][0])
+    for k in _RA_PUSH_DROP_NW0_KEYS
+        haskey(light_nw0, k) && delete!(light_nw0, k)
+    end
+    light[:nw][0] = light_nw0
+    # Defensively drop repday "data" even if generate_network.jl already made :repdays dataless, so
+    # the push stays light regardless of whether that source fix is synced.
+    if haskey(light_nw0, :repdays) && (light_nw0[:repdays] isa AbstractDict)
+        reps0 = copy(light_nw0[:repdays])
+        light_nw0[:repdays] = reps0
+        for (rk, rentry) in am_reference_data[:nw][0][:repdays]
+            if rentry isa AbstractDict && haskey(rentry, "data")
+                le = copy(rentry); delete!(le, "data"); reps0[rk] = le
+            end
+        end
+    end
+    if haskey(light[:nw][0], :planning_stages)
+        light[:nw][0][:planning_stages] = copy(am_reference_data[:nw][0][:planning_stages])
+        for y in keys(am_reference_data[:nw][0][:planning_stages])
+            ps_y_orig = am_reference_data[:nw][0][:planning_stages][y]
+            (ps_y_orig isa AbstractDict && haskey(ps_y_orig, "repdays")) || continue
+            ps_y = copy(ps_y_orig)
+            light[:nw][0][:planning_stages][y] = ps_y
+            reps = copy(ps_y_orig["repdays"])
+            ps_y["repdays"] = reps
+            for (rk, rentry) in ps_y_orig["repdays"]
+                if rentry isa AbstractDict && haskey(rentry, "data")
+                    le = copy(rentry); delete!(le, "data"); reps[rk] = le
+                end
+            end
+        end
+    end
+    return light
+end
+
+# Build a push copy of RA_setting with the renewable day-group cache stripped (workers lazily load
+# those shards from disk). Shallow copy so the master's RA_setting keeps the full data; every
+# path/scalar key is preserved, so this also removes the redundant full-dict shipping on the two
+# path-reading remotecalls. MUST NOT mutate the input.
+function _build_light_ra_setting_for_push(RA_setting)
+    light = copy(RA_setting)
+    haskey(light, "renewable_scenario_daygroup_data") && delete!(light, "renewable_scenario_daygroup_data")
+    return light
+end
+
+# Shard the repday time-series to shared disk, one repday_<dg>.jld2 per day-group, so workers load
+# only the groups they process. Mirrors _write_reference_ed_cache!: threaded, atomic per file, and
+# skips any file that already exists (ELCC re-calls stay cheap).
+function _write_repday_shards!(repday_cache_path, am_reference_data, y, repday_groups)
+    mkpath(repday_cache_path)
+    day_group_ids = collect(keys(repday_groups))
+    written = Threads.Atomic{Int}(0)
+    skipped = Threads.Atomic{Int}(0)
+    Threads.@threads for idx in eachindex(day_group_ids)
+        dg = day_group_ids[idx]
+        file_path = joinpath(repday_cache_path, "repday_$(dg).jld2")
+        if isfile(file_path)
+            Threads.atomic_add!(skipped, 1); continue
+        end
+        repdays = Dict{String, Any}()
+        for repday_id in repday_groups[dg]["Day_Idx_List"]
+            repday_key = string(repday_id)
+            repdays[repday_key] = am_reference_data[:nw][0][:planning_stages][y]["repdays"][repday_key]
+        end
+        _atomic_jld2_write!(file_path) do f
+            f["repdays"] = repdays
+        end
+        Threads.atomic_add!(written, 1)
+    end
+    return nothing
+end
+
+# Shard the renewable-scenario day-group cache to shared disk, one renewable_<dg>.jld2 per day-group,
+# so workers load only the groups they process instead of receiving the whole dict over the wire.
+# isfile-dedup is safe because the payload is a pure function of case+year.
+function _write_renewable_shards!(renewable_cache_path, renewable_scenario_daygroup_data, repday_groups)
+    mkpath(renewable_cache_path)
+    day_group_ids = collect(keys(repday_groups))
+    written = Threads.Atomic{Int}(0)
+    skipped = Threads.Atomic{Int}(0)
+    Threads.@threads for idx in eachindex(day_group_ids)
+        dg = day_group_ids[idx]
+        file_path = joinpath(renewable_cache_path, "renewable_$(dg).jld2")
+        if isfile(file_path)
+            Threads.atomic_add!(skipped, 1); continue
+        end
+        _atomic_jld2_write!(file_path) do f
+            f["renewable"] = renewable_scenario_daygroup_data[dg]
+        end
+        Threads.atomic_add!(written, 1)
+    end
+    return nothing
+end
+
+# Push the large am_reference_data to all workers WITHOUT the master serializing it once per worker.
+# Serialize am_ref ONCE to a shared-filesystem file keyed by the static cache tag, then each worker
+# (tag-skipped if already held) deserializes it from that file in parallel. Only the file path + small
+# settings cross the wire; the payload moves via shared disk, read in parallel -> constant in worker
+# count instead of O(workers) sequential master serialization.
+# `set_paths=true` also runs the per-worker cache-path setup (ED-dispatch site parity).
+# `worker_daily_ref` / `daily_ref_for_master` mirror the per-site daily_reference_ED_solutions arg
+# of _set_ra_worker_cache! (ED site: nothing; reference-ED site: Dict{Int64,Any}()).
+function _push_am_ref_to_workers!(am_reference_data, am_setting_data, RA_setting; set_paths::Bool, worker_daily_ref, daily_ref_for_master)
+    tag = _compute_ra_static_cache_tag(am_reference_data, am_setting_data, RA_setting)
+    # Master in-memory cache (no disk round-trip for the master; identical to prior behavior).
+    _set_ra_worker_cache!(am_reference_data, am_setting_data, RA_setting, daily_ref_for_master, nothing, nothing)
+
+    remote_workers = [p for p in workers() if p != myid()]
+    isempty(remote_workers) && return nothing  # single-process: master already holds am_ref
+
+    # Serialize am_ref ONCE to shared disk (dedup by tag; reference-ED writes it, dispatch reuses).
+    output_path = string(am_reference_data[:nw][0][:output_path])
+    amref_file = joinpath(output_path, "RA_amref_cache", "amref_" * string(hash(tag)) * ".jls")
+    if !isfile(amref_file)
+        # Workers lazily load repday "data" shards; ship a light ref (repday data stripped).
+        light = _build_light_am_ref_for_push(am_reference_data)
+        _atomic_serialize_write!(light, amref_file)
+    end
+
+    # Strip the renewable day-group cache ONCE; workers lazily load those shards from disk. Light still
+    # carries every path/scalar key, so the path-reading remotecalls below no longer ship the full dict.
+    light_ra_setting = _build_light_ra_setting_for_push(RA_setting)
+
+    @sync for p in remote_workers
+        @async begin
+            needs_refresh = !remotecall_fetch(p, tag) do expected_tag
+                get(_RA_WORKER_CACHE, :static_cache_tag, nothing) == expected_tag
+            end
+            if needs_refresh
+                remotecall_fetch(p, amref_file, am_setting_data, light_ra_setting, worker_daily_ref) do file, am_set, ra_set, daily_ref
+                    am_ref = open(deserialize, file)
+                    _set_ra_worker_cache!(am_ref, am_set, ra_set, daily_ref, nothing, nothing)
+                    nothing
+                end
+            end
+            # Repday/renewable lazy-load paths must be set on EVERY push (reference-ED workers hit the
+            # first push with set_paths=false but still build local refs that lazily load shards).
+            remotecall_fetch(p, light_ra_setting) do ra_set
+                if haskey(ra_set, "repday_cache_path")
+                    _set_ra_repday_cache_path!(ra_set["repday_cache_path"])
+                end
+                if haskey(ra_set, "renewable_cache_path")
+                    _set_ra_renewable_cache_path!(ra_set["renewable_cache_path"])
+                end
+                nothing
+            end
+            if set_paths
+                remotecall_fetch(p, light_ra_setting) do ra_set
+                    if haskey(_RA_WORKER_CACHE, :daily_reference_ED_solutions)
+                        delete!(_RA_WORKER_CACHE, :daily_reference_ED_solutions)
+                    end
+                    if haskey(ra_set, "outage_cache_path")
+                        _set_ra_worker_cache_path!(ra_set["outage_cache_path"])
+                    end
+                    if haskey(ra_set, "reference_cache_path")
+                        _set_ra_reference_cache_path!(ra_set["reference_cache_path"])
+                    end
+                    _RA_WORKER_CACHE[:reference_day_cache_size] = max(1, Int(get(ra_set, "reference_day_cache_size_value", 8)))
+                    nothing
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+# Pure dense pack for one day-group: risk_id=>BitMatrix dict -> (scenarios3d, risk_id_to_idx,
+# valid_risk_ids). Shared by the per-day cache writer and the coarse partial-file sampler so the
+# on-disk layout stays byte-identical. Empty input yields falses(0,0,0) + empty map.
+function _pack_day_group(day_dict)
+    risk_ids = sort(collect(keys(day_dict)))
+
+    # Keep only scenarios that carry an outage matrix; filtered-out scenarios are often stored as [].
+    valid_risk_ids = [rid for rid in risk_ids if day_dict[rid] isa AbstractMatrix]
+    risk_id_to_idx = Dict{Int, Int}()
+
+    if isempty(valid_risk_ids)
+        return falses(0, 0, 0), risk_id_to_idx, Int[]
+    end
+
+    sample = day_dict[valid_risk_ids[1]]
+    num_hours, num_gens = size(sample)
+
+    # Enforce consistent matrix size within the same day-group cache file.
+    valid_risk_ids = [rid for rid in valid_risk_ids if size(day_dict[rid]) == (num_hours, num_gens)]
+    num_scenarios = length(valid_risk_ids)
+    scenarios = falses(num_hours, num_gens, num_scenarios)
+    for (i, rid) in enumerate(valid_risk_ids)
+        scenarios[:, :, i] = day_dict[rid]
+        risk_id_to_idx[rid] = i
+    end
+    return scenarios, risk_id_to_idx, valid_risk_ids
+end
+
+# Canonical dense pack-and-write for one day-group. Shared by the per-day cache writer
+# and the partial-file sampler so the on-disk layout stays byte-identical.
+# Returns the sorted valid_risk_ids that were written (empty for the empty-file branch).
+function _pack_and_write_day_group!(file_path::String, day_dict)
+    scenarios, risk_id_to_idx, valid_risk_ids = _pack_day_group(day_dict)
+    _atomic_jld2_write!(file_path) do f
+        f["scenarios"] = scenarios
+        f["risk_id_to_idx"] = risk_id_to_idx
+    end
+    return valid_risk_ids
+end
+
 function _write_risk_scenario_cache!(outage_cache_path::String, risk_scenario_dict::Dict{Int64, Any}; prefix::String="day")
     mkpath(outage_cache_path)
     # Materialize iteration order for Threads.@threads; each iteration writes a unique file
@@ -2398,39 +2710,8 @@ function _write_risk_scenario_cache!(outage_cache_path::String, risk_scenario_di
     day_group_ids = collect(keys(risk_scenario_dict))
     Threads.@threads for idx in eachindex(day_group_ids)
         day_group_id = day_group_ids[idx]
-        day_dict = risk_scenario_dict[day_group_id]
-        risk_ids = sort(collect(keys(day_dict)))
-
-        # Keep only scenarios that carry an outage matrix; filtered-out scenarios are often stored as [].
-        valid_risk_ids = [rid for rid in risk_ids if day_dict[rid] isa AbstractMatrix]
-        risk_id_to_idx = Dict{Int, Int}()
-
-        if isempty(valid_risk_ids)
-            file_path = joinpath(outage_cache_path, "$(prefix)_$(day_group_id).jld2")
-            _atomic_jld2_write!(file_path) do f
-                f["scenarios"] = falses(0, 0, 0)
-                f["risk_id_to_idx"] = risk_id_to_idx
-            end
-            continue
-        end
-
-        sample = day_dict[valid_risk_ids[1]]
-        num_hours, num_gens = size(sample)
-
-        # Enforce consistent matrix size within the same day-group cache file.
-        valid_risk_ids = [rid for rid in valid_risk_ids if size(day_dict[rid]) == (num_hours, num_gens)]
-        num_scenarios = length(valid_risk_ids)
-        scenarios = falses(num_hours, num_gens, num_scenarios)
-        for (i, rid) in enumerate(valid_risk_ids)
-            scenarios[:, :, i] = day_dict[rid]
-            risk_id_to_idx[rid] = i
-        end
-
         file_path = joinpath(outage_cache_path, "$(prefix)_$(day_group_id).jld2")
-        _atomic_jld2_write!(file_path) do f
-            f["scenarios"] = scenarios
-            f["risk_id_to_idx"] = risk_id_to_idx
-        end
+        _pack_and_write_day_group!(file_path, risk_scenario_dict[day_group_id])
     end
     return nothing
 end
@@ -2522,6 +2803,35 @@ function _load_risk_scenarios_from_cache_batch(risk_index_list; newgen::Bool=fal
     return risk_scenario
 end
 
+# Reassemble the full risk_scenario_dict (day => risk_id => BitMatrix) from the coarse per-segment
+# partials. Initialize every day in simulation_list, then for each segment open its file once and
+# bulk-read every stored day's dense pack. Shaped exactly like the old in-memory dict so the
+# downstream couple/filter/cache flow is identical.
+function _reconstitute_risk_scenario_dict_from_partials(partials_dir, seg_list, simulation_list)
+    dict = Dict{Int64, Any}()
+    for day_group_id in simulation_list
+        dict[Int64(day_group_id)] = Dict{Int64, Any}()
+    end
+
+    for seg in seg_list
+        file_path = joinpath(partials_dir, "seg_$(seg).jld2")
+        isfile(file_path) || continue
+        jldopen(file_path, "r") do f
+            day_group_ids = f["day_group_ids"]
+            for dg in day_group_ids
+                scenarios = f["scenarios_$(dg)"]
+                size(scenarios, 3) == 0 && continue  # empty pack for this (day, seg)
+                idx_map = f["ridx_$(dg)"]
+                target = dict[Int64(dg)]
+                for (rid, idx) in idx_map
+                    target[Int64(rid)] = scenarios[:, :, idx]
+                end
+            end
+        end
+    end
+    return dict
+end
+
 function _get_filtered_joint_scenario(filtered_joint_scenario_map, day_group_id::Int, joint_id::Int)
     if !haskey(filtered_joint_scenario_map, day_group_id) || !haskey(filtered_joint_scenario_map[day_group_id], joint_id)
         error("Filtered joint scenario is missing day_group_id=$day_group_id, joint_id=$joint_id.")
@@ -2591,6 +2901,95 @@ function _load_reference_ed_solution_from_cache(day_group_id::Int, renewable_sce
     return solution
 end
 
+# Guards the per-worker repday LRU: _build_ra_local_reference_for_scenario runs concurrently under
+# Threads.@spawn in the post-contingency path, so unlike the reference-ED LRU this cache can be hit
+# from multiple threads on one worker and its mutation must be serialized.
+const _REPDAY_CACHE_LOCK = ReentrantLock()
+const _REPDAY_CACHE_SIZE = 8  # per-worker day-group repday shards kept in RAM (hard-coded; not a workbook setting)
+
+# Lazily load one day-group's repday shard, per-worker FIFO-LRU cached. Returns the raw shard dict
+# {string(repday_id) => repday entry}; callers deepcopy before mutating (it is shared, READ-ONLY).
+function _load_repday_shard(day_group_id::Int)
+    lock(_REPDAY_CACHE_LOCK) do
+        repday_cache_path = _RA_WORKER_CACHE[:repday_cache_path]
+        day_cache = _RA_WORKER_CACHE[:repday_day_cache]
+        day_cache_order = get!(_RA_WORKER_CACHE, :repday_day_cache_order, Int[])
+        cache_limit = _REPDAY_CACHE_SIZE
+        if haskey(day_cache, day_group_id)
+            idx = findfirst(==(day_group_id), day_cache_order)
+            if idx !== nothing
+                deleteat!(day_cache_order, idx)
+            end
+            push!(day_cache_order, day_group_id)
+            return day_cache[day_group_id]
+        end
+        file_path = joinpath(repday_cache_path, "repday_$(day_group_id).jld2")
+        if !isfile(file_path)
+            error("Repday shard cache file not found: $file_path")
+        end
+        shard = try
+            jldopen(file_path, "r") do f
+                f["repdays"]
+            end
+        catch err
+            error("Failed to read repday shard cache: $file_path (day_group_id=$day_group_id) | $(sprint(showerror, err))")
+        end
+        day_cache[day_group_id] = shard
+        push!(day_cache_order, day_group_id)
+        while length(day_cache_order) > cache_limit
+            evict_key = popfirst!(day_cache_order)
+            if haskey(day_cache, evict_key)
+                delete!(day_cache, evict_key)
+            end
+        end
+        return shard
+    end
+end
+
+# Guards the per-worker renewable-scenario LRU; like the repday LRU it can be hit concurrently from
+# the Threads.@spawn post-contingency path, so its mutation must be serialized.
+const _RENEWABLE_CACHE_LOCK = ReentrantLock()
+const _RENEWABLE_CACHE_SIZE = 8  # per-worker day-group renewable shards kept in RAM (hard-coded; not a workbook setting)
+
+# Lazily load one day-group's renewable-scenario shard, per-worker FIFO-LRU cached. Returns the raw
+# shard dict {scenario_id => {tech => {tag => Vector{Float64}}}} READ-ONLY (consumers only read it).
+function _load_renewable_shard(day_group_id::Int)
+    lock(_RENEWABLE_CACHE_LOCK) do
+        renewable_cache_path = _RA_WORKER_CACHE[:renewable_cache_path]
+        day_cache = _RA_WORKER_CACHE[:renewable_day_cache]
+        day_cache_order = get!(_RA_WORKER_CACHE, :renewable_day_cache_order, Int[])
+        cache_limit = _RENEWABLE_CACHE_SIZE
+        if haskey(day_cache, day_group_id)
+            idx = findfirst(==(day_group_id), day_cache_order)
+            if idx !== nothing
+                deleteat!(day_cache_order, idx)
+            end
+            push!(day_cache_order, day_group_id)
+            return day_cache[day_group_id]
+        end
+        file_path = joinpath(renewable_cache_path, "renewable_$(day_group_id).jld2")
+        if !isfile(file_path)
+            error("Renewable shard cache file not found: $file_path")
+        end
+        shard = try
+            jldopen(file_path, "r") do f
+                f["renewable"]
+            end
+        catch err
+            error("Failed to read renewable shard cache: $file_path (day_group_id=$day_group_id) | $(sprint(showerror, err))")
+        end
+        day_cache[day_group_id] = shard
+        push!(day_cache_order, day_group_id)
+        while length(day_cache_order) > cache_limit
+            evict_key = popfirst!(day_cache_order)
+            if haskey(day_cache, evict_key)
+                delete!(day_cache, evict_key)
+            end
+        end
+        return shard
+    end
+end
+
 function _start_ra_worker_progress_logger(report_log::Bool, detailed_log::Bool, last_simulation_id::Int, total_num_risk_scenarios::Int)
     if !report_log
         return nothing, nothing
@@ -2630,7 +3029,6 @@ function _start_ra_worker_progress_logger(report_log::Bool, detailed_log::Bool, 
             try
                 worker_id, msg = take!(worker_log_ch)
                 m_done = match(r"master_done sim=(\d+) scenarios=(\d+)", msg)
-                m = match(r"sim=(\d+) progress=(\d+)% \((\d+)/(\d+)\) t=([0-9.]+)s", msg)
                 if m_done !== nothing
                     sim_id = parse(Int, m_done.captures[1])
                     done = parse(Int, m_done.captures[2])
@@ -2654,17 +3052,6 @@ function _start_ra_worker_progress_logger(report_log::Bool, detailed_log::Bool, 
                             end
                         end
                     end
-                elseif m !== nothing
-                    sim_id = parse(Int, m.captures[1])
-                    pct = parse(Int, m.captures[2])
-                    done = parse(Int, m.captures[3])
-                    total = parse(Int, m.captures[4])
-
-                    if detailed_log && (pct == 25 || pct == 50 || pct == 75 || pct == 100)
-                        @aleaf_info "[ALEAF RA ED Analysis][worker $(worker_id)]: sim=$(sim_id) progress=$(pct)% ($(done)/$(total))"
-                    end
-                elseif detailed_log
-                    @aleaf_info "[ALEAF RA ED Analysis][worker $worker_id]: $msg"
                 end
             catch
                 break
@@ -2708,7 +3095,7 @@ function _get_required_ra_worker_cache!(keys_needed::Vector{Symbol})
     return nothing
 end
 
-function perform_ED_analysis_for_RA(am_reference_data, am_setting_data, RA_setting, risk_scenario_dict, filtered_joint_scenario_map; risk_scenario_dict_of_new_gen = [], constant_load = 0.0, constant_load_bus_idx=nothing, constant_load_distribution="single_bus", constant_load_distribution_profile=Dict{Tuple{Int, Int, Int}, Dict{Int, Float64}}(), report_log=true, iter=1, force_ELCC_flag=false)
+function perform_ED_analysis_for_RA(am_reference_data, am_setting_data, RA_setting, risk_scenario_dict, filtered_joint_scenario_map; risk_scenario_dict_of_new_gen = [], constant_load = 0.0, constant_load_bus_idx=nothing, constant_load_distribution="single_bus", constant_load_distribution_profile=Dict{Tuple{Int, Int, Int}, Dict{Int, Float64}}(), report_log=true, iter=1, force_ELCC_flag=false, metric_ctx=nothing, metric_acc=nothing, discard_scenario_detail=false)
     
     # ALEAF_model_instance build-------------------------------------------------
     detailed_log = lowercase(string(get(RA_setting, "logging_level_value", "simple"))) == "detailed"
@@ -2774,7 +3161,7 @@ function perform_ED_analysis_for_RA(am_reference_data, am_setting_data, RA_setti
         reference_cache_path = joinpath(am_reference_data[:nw][0][:output_path], "RA_reference_cache")
         _write_reference_ed_cache!(reference_cache_path, daily_reference_ED_solutions)
         RA_setting["reference_cache_path"] = reference_cache_path
-        if report_log
+        if report_log && detailed_log
             @aleaf_info "[ALEAF RA ED Analysis]: Reference ED cache written to $reference_cache_path"
         end
     end
@@ -2793,43 +3180,22 @@ function perform_ED_analysis_for_RA(am_reference_data, am_setting_data, RA_setti
         end
     end
 
-    # push static cache to workers (reference ED solutions are loaded from disk cache on-demand)
-    static_cache_tag = _compute_ra_static_cache_tag(am_reference_data, am_setting_data, RA_setting)
-    _set_ra_worker_cache!(am_reference_data, am_setting_data, RA_setting, nothing, nothing, nothing)
+    # push static cache to workers (reference ED solutions are loaded from disk cache on-demand).
+    # am_ref goes via serialize-once-to-shared-disk + parallel worker load (see _push_am_ref_to_workers!).
+    # Master-side cache-path setup stays here (configures the MASTER's _RA_WORKER_CACHE paths).
     if haskey(RA_setting, "outage_cache_path")
         _set_ra_worker_cache_path!(RA_setting["outage_cache_path"])
     end
     if haskey(RA_setting, "reference_cache_path")
         _set_ra_reference_cache_path!(RA_setting["reference_cache_path"])
     end
-    @sync for p in worker_list
-        if p != myid()
-            @async begin
-                needs_refresh = !remotecall_fetch(p, static_cache_tag) do expected_tag
-                    get(_RA_WORKER_CACHE, :static_cache_tag, nothing) == expected_tag
-                end
-                if needs_refresh
-                    remotecall_fetch(p, am_reference_data, am_setting_data, RA_setting) do am_ref, am_set, ra_set
-                        _set_ra_worker_cache!(am_ref, am_set, ra_set, nothing, nothing, nothing)
-                        nothing
-                    end
-                end
-                remotecall_fetch(p, RA_setting) do ra_set
-                    if haskey(_RA_WORKER_CACHE, :daily_reference_ED_solutions)
-                        delete!(_RA_WORKER_CACHE, :daily_reference_ED_solutions)
-                    end
-                    if haskey(ra_set, "outage_cache_path")
-                        _set_ra_worker_cache_path!(ra_set["outage_cache_path"])
-                    end
-                    if haskey(ra_set, "reference_cache_path")
-                        _set_ra_reference_cache_path!(ra_set["reference_cache_path"])
-                    end
-                    _RA_WORKER_CACHE[:reference_day_cache_size] = max(1, Int(get(ra_set, "reference_day_cache_size_value", 8)))
-                    nothing
-                end
-            end
-        end
+    if haskey(RA_setting, "repday_cache_path")
+        _set_ra_repday_cache_path!(RA_setting["repday_cache_path"])
     end
+    if haskey(RA_setting, "renewable_cache_path")
+        _set_ra_renewable_cache_path!(RA_setting["renewable_cache_path"])
+    end
+    _push_am_ref_to_workers!(am_reference_data, am_setting_data, RA_setting; set_paths=true, worker_daily_ref=nothing, daily_ref_for_master=nothing)
 
     # Adaptive dynamic memory-probing batch sizing.
     configured_batch_size = max(1, Int(get(RA_setting, "num_distributed_scenarios_per_worker_value", 200)))
@@ -2923,23 +3289,42 @@ function perform_ED_analysis_for_RA(am_reference_data, am_setting_data, RA_setti
         end
         close(simulation_id_ch)
     end
+
+    # In streaming mode the per-batch heavy payload is folded + discarded on arrival
+    # (inside the concurrent fetch loop) so the master never retains all batches at once.
+    # The @async worker tasks run concurrently, so shared-state mutations are serialized
+    # by fold_lock; determinism is preserved by the sorted combine at finalize.
+    streaming_fold = (metric_acc !== nothing) && (metric_ctx !== nothing) && discard_scenario_detail
+    fold_lock = ReentrantLock()
     try
         @sync for p in worker_list
             @async begin
                 for simulation_id in simulation_id_ch
                     try
+                        local payload
                         if ELCC_flag == true
                             if effective_RA_method == "Economic Dispatch"
-                                simulation_set_solution[simulation_id] = remotecall_fetch(run_ra_perfect_foresight_batch!, p, simulation_set[simulation_id], p, simulation_id; constant_load, constant_load_bus_idx, constant_load_distribution, constant_load_distribution_profile, new_gen_risk_scenario = nothing, report_log, iter, worker_log_ch, force_ELCC_flag = ELCC_flag)
+                                payload = remotecall_fetch(run_ra_perfect_foresight_batch!, p, simulation_set[simulation_id], p, simulation_id; constant_load, constant_load_bus_idx, constant_load_distribution, constant_load_distribution_profile, new_gen_risk_scenario = nothing, report_log, iter, worker_log_ch, force_ELCC_flag = ELCC_flag)
                             elseif effective_RA_method == "Sequential Economic Dispatch"
-                                simulation_set_solution[simulation_id] = remotecall_fetch(run_ra_imperfect_foresight_sequential_snapshot_batch!, p, simulation_set[simulation_id], p, simulation_id; constant_load, constant_load_bus_idx, constant_load_distribution, constant_load_distribution_profile, new_gen_risk_scenario = nothing, report_log, iter, worker_log_ch, force_ELCC_flag = ELCC_flag)
+                                payload = remotecall_fetch(run_ra_imperfect_foresight_sequential_snapshot_batch!, p, simulation_set[simulation_id], p, simulation_id; constant_load, constant_load_bus_idx, constant_load_distribution, constant_load_distribution_profile, new_gen_risk_scenario = nothing, report_log, iter, worker_log_ch, force_ELCC_flag = ELCC_flag)
                             end
                         else
                             if effective_RA_method == "Economic Dispatch"
-                                simulation_set_solution[simulation_id] = remotecall_fetch(run_ra_perfect_foresight_batch!, p, simulation_set[simulation_id], p, simulation_id; report_log, worker_log_ch)
+                                payload = remotecall_fetch(run_ra_perfect_foresight_batch!, p, simulation_set[simulation_id], p, simulation_id; report_log, worker_log_ch)
                             elseif effective_RA_method == "Sequential Economic Dispatch"
-                                simulation_set_solution[simulation_id] = remotecall_fetch(run_ra_imperfect_foresight_sequential_snapshot_batch!, p, simulation_set[simulation_id], p, simulation_id; report_log, worker_log_ch)
+                                payload = remotecall_fetch(run_ra_imperfect_foresight_sequential_snapshot_batch!, p, simulation_set[simulation_id], p, simulation_id; report_log, worker_log_ch)
                             end
+                        end
+
+                        if streaming_fold
+                            # Fold + discard this batch's heavy detail now, before the next
+                            # batch accumulates, keeping master memory O(one day-group).
+                            # The ED solve already ran remotely; only the brief fold is locked.
+                            lock(fold_lock) do
+                                _fold_batch_payload_into_metric_acc!(payload, metric_acc, metric_ctx, RA_solution, DLOL_unit_accumulator_global, run_DLOL_flag)
+                            end
+                        else
+                            simulation_set_solution[simulation_id] = payload
                         end
                         _emit_worker_log!(worker_log_ch, p, "master_done sim=$simulation_id scenarios=$(length(simulation_set[simulation_id]))")
                     catch err
@@ -2959,24 +3344,30 @@ function perform_ED_analysis_for_RA(am_reference_data, am_setting_data, RA_setti
         end
     end
 
-    # Accept both payload formats: legacy scenario result dict, or DLOL wrapped dict
-    # containing scenario_results + DLOL partials.
-    for simulation_idx in keys(simulation_set_solution)
-        worker_payload = simulation_set_solution[simulation_idx]
-        scenario_results = worker_payload
-        if (worker_payload isa AbstractDict) && haskey(worker_payload, "scenario_results")
-            scenario_results = worker_payload["scenario_results"]
-        end
+    # Non-streaming path (detailed / ELCC): retain full payloads and merge here.
+    # The streaming path already folded + discarded each batch inside the fetch loop.
+    if !streaming_fold
+        # Accept both payload formats: legacy scenario result dict, or DLOL wrapped dict
+        # containing scenario_results + DLOL partials.
+        for simulation_idx in keys(simulation_set_solution)
+            worker_payload = simulation_set_solution[simulation_idx]
+            scenario_results = worker_payload
+            if (worker_payload isa AbstractDict) && haskey(worker_payload, "scenario_results")
+                scenario_results = worker_payload["scenario_results"]
+            end
 
-        # Merge worker-level DLOL partial accumulator when available.
-        if run_DLOL_flag
-            _merge_DLOL_worker_partials!(DLOL_unit_accumulator_global, worker_payload)
-        end
+            # Merge worker-level DLOL partial accumulator when available.
+            if run_DLOL_flag
+                _merge_DLOL_worker_partials!(DLOL_unit_accumulator_global, worker_payload)
+            end
 
-        for risk_index in keys(scenario_results)
-            day_group_id = risk_index[1]
-            joint_id = risk_index[2]
-            RA_solution[string(day_group_id)][joint_id] = scenario_results[risk_index]
+            for risk_index in keys(scenario_results)
+                day_group_id = risk_index[1]
+                joint_id = risk_index[2]
+                day_key = string(day_group_id)
+                metric_acc !== nothing && (metric_acc[:solved_scenarios_by_daygroup][day_key] = get(metric_acc[:solved_scenarios_by_daygroup], day_key, 0) + 1)
+                RA_solution[day_key][joint_id] = scenario_results[risk_index]
+            end
         end
     end
 
@@ -3003,6 +3394,38 @@ function perform_ED_analysis_for_RA(am_reference_data, am_setting_data, RA_setti
     end
 
     return RA_solution
+end
+
+
+# Streaming reducer: fold one batch payload into the metric accumulator and write only
+# the light ENS stub into RA_solution, so the heavy per-scenario detail is released on
+# arrival. Must be called under fold_lock (mutates shared accumulators / RA_solution).
+function _fold_batch_payload_into_metric_acc!(worker_payload, metric_acc, metric_ctx, RA_solution, DLOL_unit_accumulator_global::Dict{Int, Dict{Symbol, Any}}, run_DLOL_flag::Bool)
+    scenario_results = worker_payload
+    if (worker_payload isa AbstractDict) && haskey(worker_payload, "scenario_results")
+        scenario_results = worker_payload["scenario_results"]
+    end
+
+    # Merge worker-level DLOL partials exactly once per batch.
+    if run_DLOL_flag
+        _merge_DLOL_worker_partials!(DLOL_unit_accumulator_global, worker_payload)
+    end
+
+    for risk_index in keys(scenario_results)
+        day_group_id = risk_index[1]
+        joint_id = risk_index[2]
+        day_key = string(day_group_id)
+        metric_acc[:solved_scenarios_by_daygroup][day_key] = get(metric_acc[:solved_scenarios_by_daygroup], day_key, 0) + 1
+
+        # Keep only the scalar ENS summaries the ELCC pre-filter reads; drop ["solution"]
+        # (scarcity/dispatch/storage) so master memory stays O(one day-group).
+        sr = scenario_results[risk_index]
+        _fold_scenario_into_metric_acc!(metric_acc, metric_ctx, sr, Int(day_group_id), Int(joint_id))
+        RA_solution[day_key][joint_id] = Dict{String, Any}(
+            "total ENS" => get(sr, "total ENS", 0.0),
+            "max ENS" => get(sr, "max ENS", 0.0)
+        )
+    end
 end
 
 
@@ -3230,12 +3653,15 @@ function _build_ra_local_reference_for_scenario(am_reference_data, RA_setting, r
     local_ref[:nw][0][:vre_zdt_index] = (d = d_pos, h = h_pos)
     local_ref[:nw][0][:vre_aggregated_data_zdt] = Dict{Int, Dict{Int, Array{Float64,3}}}()
     local_ref[:nw][0][:vre_aggregated_data_zdt][y] = Dict{Int, Array{Float64,3}}()
+    # Lazily load this day-group's repday shard; keep the per-use deepcopy so the downstream VRE
+    # injection mutates a private copy, not the shared (READ-ONLY) worker LRU.
+    shard = _load_repday_shard(day_group_id)
     for repday_id in repday_ids
         repday_key = string(repday_id)
-        local_ref[:nw][0][:planning_stages][y]["repdays"][repday_key] = deepcopy(am_reference_data[:nw][0][:planning_stages][y]["repdays"][repday_key])
+        local_ref[:nw][0][:planning_stages][y]["repdays"][repday_key] = deepcopy(shard[repday_key])
     end
 
-    scenario_cache = RA_setting["renewable_scenario_daygroup_data"][day_group_id][renewable_scenario_id]
+    scenario_cache = _load_renewable_shard(day_group_id)[renewable_scenario_id]
     row_idx = 1
     for repday_id in repday_ids
         repday_key = string(repday_id)
@@ -3329,7 +3755,31 @@ end
 function perform_reference_ED_simulation_for_RA(filtered_joint_scenario_map, am_reference_data, am_setting_data, RA_setting; constant_load = 0.0, constant_load_bus_idx=nothing, constant_load_distribution="single_bus", constant_load_distribution_profile=Dict{Tuple{Int, Int, Int}, Dict{Int, Float64}}(), ELCC_flag=false)
     
     # ALEAF_model_instance build-------------------------------------------------
- 
+
+    # Shard repday time-series to shared disk and register the path before the push, so the light
+    # am_ref can drop repday "data" and workers lazily load only the groups they process.
+    if haskey(am_reference_data[:nw][0], :output_path)
+        repday_cache_path = joinpath(string(am_reference_data[:nw][0][:output_path]), "RA_repday_cache")
+        RA_setting["repday_cache_path"] = repday_cache_path
+        _write_repday_shards!(repday_cache_path, am_reference_data, RA_setting["current_year"], am_reference_data[:nw][0][:repday_groups])
+        if lowercase(string(get(RA_setting, "logging_level_value", "simple"))) == "detailed"
+            @aleaf_info "[ALEAF RA Model]: Repday cache written to $repday_cache_path"
+        end
+        # Master also builds local refs (single-process + any worker-less fallback), so it must hold
+        # the repday LRU path too; worker paths are set per-push in _push_am_ref_to_workers!.
+        _set_ra_repday_cache_path!(repday_cache_path)
+        # Shard the renewable day-group cache too; the light RA_setting drops it from the push and
+        # workers lazily load only the groups they process. RA_setting still holds the full data on
+        # the master (the strip happens only inside the push via the light copy).
+        renewable_cache_path = joinpath(string(am_reference_data[:nw][0][:output_path]), "RA_renewable_cache")
+        RA_setting["renewable_cache_path"] = renewable_cache_path
+        _write_renewable_shards!(renewable_cache_path, RA_setting["renewable_scenario_daygroup_data"], am_reference_data[:nw][0][:repday_groups])
+        if lowercase(string(get(RA_setting, "logging_level_value", "simple"))) == "detailed"
+            @aleaf_info "[ALEAF RA Model]: Renewable cache written to $renewable_cache_path"
+        end
+        _set_ra_renewable_cache_path!(renewable_cache_path)
+    end
+
     # initialize
     daily_reference_ED_solutions = Dict{Int64, Any}()
     dispatch_report = false
@@ -3346,31 +3796,15 @@ function perform_reference_ED_simulation_for_RA(filtered_joint_scenario_map, am_
     configured_limit = max(1, RA_setting["num_distributed_scenarios_per_worker_value"])
     num_sim_limit_per_call = configured_limit
 
-    # Cache large static data on workers; tag-based skip avoids re-sending the multi-MB
-    # reference data a worker already holds, and the push is parallelized via @sync @async.
-    static_cache_tag = _compute_ra_static_cache_tag(am_reference_data, am_setting_data, RA_setting)
-    _set_ra_worker_cache!(am_reference_data, am_setting_data, RA_setting, Dict{Int64, Any}(), nothing, nothing)
-
+    # Cache large static data on workers; tag-based skip avoids re-sending the multi-GB
+    # reference data a worker already holds. am_ref goes via serialize-once-to-shared-disk +
+    # parallel worker load (see _push_am_ref_to_workers!).
     futures = Vector{Tuple{Future, Int}}()
     worker_list = workers()
     if isempty(worker_list)
         error("No distributed workers are available for reference ED analysis.")
     end
-    @sync for p in worker_list
-        if p != myid()
-            @async begin
-                needs_refresh = !remotecall_fetch(p, static_cache_tag) do expected_tag
-                    get(_RA_WORKER_CACHE, :static_cache_tag, nothing) == expected_tag
-                end
-                if needs_refresh
-                    remotecall_fetch(p, am_reference_data, am_setting_data, RA_setting) do am_ref, am_set, ra_set
-                        _set_ra_worker_cache!(am_ref, am_set, ra_set, Dict{Int64, Any}(), nothing, nothing)
-                        nothing
-                    end
-                end
-            end
-        end
-    end
+    _push_am_ref_to_workers!(am_reference_data, am_setting_data, RA_setting; set_paths=false, worker_daily_ref=Dict{Int64, Any}(), daily_ref_for_master=Dict{Int64, Any}())
 
     # Ensure reference ED utilizes all available workers by targeting at least
     # one simulation chunk per worker when daygroups are sufficient.
@@ -3495,12 +3929,6 @@ end
 function run_ra_perfect_foresight_batch!(risk_index_list, worker_id, simulation_id; constant_load=0.0, constant_load_bus_idx=nothing, constant_load_distribution="single_bus", constant_load_distribution_profile=Dict{Tuple{Int, Int, Int}, Dict{Int, Float64}}(), new_gen_risk_scenario=nothing, report_log=true, iter=1, worker_log_ch=nothing, force_ELCC_flag=false)
 
     RA_solution = Dict()
-    if report_log
-        if worker_log_ch === nothing
-            @aleaf_info "[ALEAF RA ED Analysis]: Worker $worker_id start simulation id $simulation_id (risk_count=$(length(risk_index_list)), threads=$(Threads.nthreads()))"
-        end
-        _emit_worker_log!(worker_log_ch, worker_id, "start simulation_id=$simulation_id risk_count=$(length(risk_index_list))")
-    end
 
     _get_required_ra_worker_cache!([:am_reference_data, :am_setting_data, :RA_setting, :outage_cache_path])
     am_reference_data = _RA_WORKER_CACHE[:am_reference_data]
@@ -3553,7 +3981,6 @@ function run_ra_perfect_foresight_batch!(risk_index_list, worker_id, simulation_
     else
         RA_solution = run_ra_perfect_foresight_cases!(risk_index_list, joint_scenario_lookup, risk_scenario, am_reference_data, am_setting_data, daily_reference_ED_solutions, RA_setting; constant_load, constant_load_bus_idx, constant_load_distribution, constant_load_distribution_profile, report_log, worker_id, simulation_id, worker_log_ch, force_ELCC_flag)
     end
-    _emit_worker_log!(worker_log_ch, worker_id, "finish simulation_id=$simulation_id")
 
 
     return RA_solution
@@ -3865,12 +4292,6 @@ end
 function run_ra_imperfect_foresight_sequential_snapshot_batch!(risk_index_list, worker_id, simulation_id; constant_load=0.0, constant_load_bus_idx=nothing, constant_load_distribution="single_bus", constant_load_distribution_profile=Dict{Tuple{Int, Int, Int}, Dict{Int, Float64}}(), new_gen_risk_scenario=nothing, report_log=true, iter=1, worker_log_ch=nothing, force_ELCC_flag=false)
 
     RA_solution = Dict()
-    if report_log
-        if worker_log_ch === nothing
-            @aleaf_info "[ALEAF RA ED Analysis]: Worker $worker_id start sequential simulation id $simulation_id (risk_count=$(length(risk_index_list)), threads=$(Threads.nthreads()))"
-        end
-        _emit_worker_log!(worker_log_ch, worker_id, "start sequential simulation_id=$simulation_id risk_count=$(length(risk_index_list))")
-    end
 
     _get_required_ra_worker_cache!([:am_reference_data, :am_setting_data, :RA_setting, :outage_cache_path])
     am_reference_data = _RA_WORKER_CACHE[:am_reference_data]
@@ -3922,7 +4343,6 @@ function run_ra_imperfect_foresight_sequential_snapshot_batch!(risk_index_list, 
         RA_solution = run_ra_imperfect_foresight_sequential_snapshot_cases!(risk_index_list, joint_scenario_lookup, risk_scenario, am_reference_data, am_setting_data, daily_reference_ED_solutions, RA_setting, simulation_id; constant_load, constant_load_bus_idx, constant_load_distribution, constant_load_distribution_profile, report_log, worker_id, worker_log_ch, force_ELCC_flag)
 
     end
-    _emit_worker_log!(worker_log_ch, worker_id, "finish sequential simulation_id=$simulation_id")
 
 
     return RA_solution
@@ -4317,8 +4737,7 @@ function run_ra_imperfect_foresight_sequential_snapshot_cases!(risk_index_list, 
     # Initialize progress tracking
     total_work = length(outage_scenario_list)
     pct_step    = 25              # log every x%
-    t0 = time()
-    
+
     # Channel/logger only when reporting is enabled.
     progress_ch = report_log ? Channel{Bool}(Inf) : nothing
     logger_task = nothing
@@ -4343,11 +4762,6 @@ function run_ra_imperfect_foresight_sequential_snapshot_cases!(risk_index_list, 
                 pct = Int(floor(100 * progress / max(total_work, 1)))
 
                 if pct >= last_pct + pct_step
-                    elapsed = time() - t0
-                    if worker_log_ch === nothing
-                        @aleaf_info "worker progress=$pct% ($progress/$total_work), elapsed= $(round(elapsed, digits=1))s"
-                    end
-                    _emit_worker_log!(worker_log_ch, worker_id, "sim=$simulation_id progress=$pct% ($progress/$total_work) t=$(round(elapsed, digits=1))s")
                     last_pct   = pct - (pct % pct_step)
                 end
             end
@@ -5942,14 +6356,462 @@ function initialize_RA_dict(am; day_group_flag = false, description = "")
 end
 
 
+# Deterministic, scenario-independent context (bus/day-group lists, demand normalizers,
+# weights) shared by the streaming fold path and the RA_solutions-based fallback. Built
+# once from am.ref/am.setting; size is O(buses x day_groups x hours), not O(scenarios).
+function _ra_build_metric_context(am, RA_Info)
+    pu_power_base = am.setting["Simulation Setting"]["per_unit_base_value"]
+    num_risk_scenario = RA_Info["setting"]["num_risk_scenario"]
+    renewable_scenario_weights = get(RA_Info["setting"], "renewable_scenario_weights", Dict{String, Float64}())
+    filtered_joint_scenario_map = get(RA_Info["RA_reference_risk_data"], "filtered_joint_scenario_map", Dict{Int, Dict{Int, Dict{String, Any}}}())
+    ids_n = [(k) for (k) in get_index(am, :bus, 0)]
+    ids_ht = [(h,t) for h in am.setting["run_H"] for t in am.setting["run_T"]]
+    ids_daygroup = [d for d in get_index(am, :repday_groups, 0)]
+    current_year = RA_Info["setting"]["current_year"]
+    system_peak_scale = RA_Info["setting"]["system_peak_scale"]
+    num_ht = length(ids_ht)
+
+    demand_list = Dict{Tuple{Int, Int, Int, Int}, Float64}()
+    total_system_demand = 0.0
+    regional_demand_list = Dict{Int, Float64}()
+    daygroup_demand_list = Dict{Int, Float64}(d => 0.0 for d in ids_daygroup)
+
+    for n in ids_n
+        regional_demand = 0.0
+        for day_group_id in ids_daygroup
+            day_idx_list = am.ref[:nw][0][:repday_groups][day_group_id]["Day_Idx_List"]
+            for d in day_idx_list
+                num_days = parameter(am, 0, :repdays, "NumDays", d)
+                for (h, t) in ids_ht
+                    # Keep demand units consistent with ENS (both scaled by pu_power_base),
+                    # and annualize representative days by NumDays.
+                    demand = get_bus_demand_with_growth(am, n, d, h, t, current_year; nw=0, system_peak_scale) * pu_power_base * num_days
+                    demand_list[(n, d, h, t)] = demand
+                    total_system_demand += demand
+                    regional_demand += demand
+                    daygroup_demand_list[day_group_id] += demand
+                end
+            end
+        end
+        regional_demand_list[n] = regional_demand
+    end
+
+    regional_daygroup_demand = Dict{Tuple{Int, Int}, Float64}()
+    for n in ids_n
+        for day_group_id in ids_daygroup
+            regional_daygroup_demand[(n, day_group_id)] = 0.0
+            day_idx_list = am.ref[:nw][0][:repday_groups][day_group_id]["Day_Idx_List"]
+            for d in day_idx_list
+                for (h, t) in ids_ht
+                    regional_daygroup_demand[(n, day_group_id)] += demand_list[(n, d, h, t)]
+                end
+            end
+        end
+    end
+
+    bus_name_dict = Dict{Int, String}()
+    for n in ids_n
+        bus_name = am.ref[:nw][0][:bus][n]["bus_i"]
+        bus_name_dict[n] = isa(bus_name, String) ? bus_name : string(bus_name)
+    end
+
+    # repday NumDays cache and per-day_group hour/day ordering (used by the fold).
+    num_days_by_d = Dict{Int, Float64}()
+    day_idx_by_daygroup = Dict{Int, Vector{Int}}()
+    for day_group_id in ids_daygroup
+        day_idx_list = am.ref[:nw][0][:repday_groups][day_group_id]["Day_Idx_List"]
+        day_idx_by_daygroup[day_group_id] = collect(day_idx_list)
+        for d in day_idx_list
+            num_days_by_d[d] = parameter(am, 0, :repdays, "NumDays", d)
+        end
+    end
+
+    return Dict{Symbol, Any}(
+        :pu_power_base => pu_power_base,
+        :num_risk_scenario => num_risk_scenario,
+        :renewable_scenario_weights => renewable_scenario_weights,
+        :filtered_joint_scenario_map => filtered_joint_scenario_map,
+        :ids_n => ids_n,
+        :ids_ht => ids_ht,
+        :ids_daygroup => ids_daygroup,
+        :current_year => current_year,
+        :num_ht => num_ht,
+        :demand_list => demand_list,
+        :total_system_demand => total_system_demand,
+        :regional_demand_list => regional_demand_list,
+        :daygroup_demand_list => daygroup_demand_list,
+        :regional_daygroup_demand => regional_daygroup_demand,
+        :bus_name_dict => bus_name_dict,
+        :num_days_by_d => num_days_by_d,
+        :day_idx_by_daygroup => day_idx_by_daygroup,
+    )
+end
+
+# Running metric accumulators sized by output (buses x day_groups x hours), NOT scenarios.
+function _ra_init_metric_accumulator(ctx)
+    ids_n = ctx[:ids_n]
+    ids_daygroup = ctx[:ids_daygroup]
+    num_ht = ctx[:num_ht]
+
+    regional_eue = Dict{Int, Float64}(n => 0.0 for n in ids_n)
+    regional_lolh = Dict{Int, Float64}(n => 0.0 for n in ids_n)
+    regional_max_consec = Dict{Int, Int}(n => 0 for n in ids_n)
+    regional_max_mwh = Dict{Int, Float64}(n => 0.0 for n in ids_n)
+    regional_max_mw = Dict{Int, Float64}(n => 0.0 for n in ids_n)
+
+    dg_eue_regional = Dict{Tuple{Int, Int}, Float64}()
+    dg_daygroup_eue = Dict{Tuple{Int, Int}, Float64}()
+    dg_eue_by_hour = Dict{Tuple{Int, Int}, Vector{Float64}}()
+    dg_neue_by_hour = Dict{Tuple{Int, Int}, Vector{Float64}}()
+    for n in ids_n
+        for day_group_id in ids_daygroup
+            dg_eue_regional[(day_group_id, n)] = 0.0
+            dg_daygroup_eue[(day_group_id, n)] = 0.0
+            dg_eue_by_hour[(day_group_id, n)] = zeros(num_ht)
+            dg_neue_by_hour[(day_group_id, n)] = zeros(num_ht)
+        end
+    end
+
+    return Dict{Symbol, Any}(
+        :regional_eue => regional_eue,
+        :regional_lolh => regional_lolh,
+        :regional_max_consec => regional_max_consec,
+        :regional_max_mwh => regional_max_mwh,
+        :regional_max_mw => regional_max_mw,
+        :dg_eue_regional => dg_eue_regional,
+        :dg_daygroup_eue => dg_daygroup_eue,
+        :dg_eue_by_hour => dg_eue_by_hour,
+        :dg_neue_by_hour => dg_neue_by_hour,
+        # Unique (day_group,joint,hour) system outage-hour weights for systemwide LOLH.
+        :hour_weight => Dict{Tuple{Tuple{Int, Int}, Tuple{Int, Int, Int}}, Float64}(),
+        # System maxima with their day_group label; label tie-broken deterministically.
+        :sys_max_consec => (0.0, 0),
+        :sys_max_mwh => (0.0, 0),
+        :sys_max_mw => (0.0, 0),
+        # Set of day_group keys that had at least one solved scenario folded in.
+        :seen_daygroups => Set{Int}(),
+        # Count of scenarios folded per day_group (for demand diagnostics).
+        :solved_scenarios_by_daygroup => Dict{String, Int}(),
+    )
+end
+
+# Fold one scenario's solution into the running accumulators. Arithmetic is identical
+# term-for-term to the per-scenario body of the original calculate_risk_metrics_ED! pass;
+# only the summation order (scenario-outer here) changes. All sums are non-negative folds.
+function _fold_scenario_into_metric_acc!(acc, ctx, scenario_solution, day_group_id, joint_id)
+    filtered_joint_scenario_map = ctx[:filtered_joint_scenario_map]
+    if !haskey(filtered_joint_scenario_map, day_group_id) || !haskey(filtered_joint_scenario_map[day_group_id], joint_id)
+        @aleaf_warn "Skipped RA metric accumulation for unexpected joint_id=$joint_id in day_group=$day_group_id"
+        return
+    end
+
+    renewable_scenario_weights = ctx[:renewable_scenario_weights]
+    num_risk_scenario = ctx[:num_risk_scenario]
+    joint_scenario = filtered_joint_scenario_map[day_group_id][joint_id]
+    renewable_scenario_id = joint_scenario["renewable_scenario_id"]
+    renewable_weight = get(renewable_scenario_weights, renewable_scenario_id, 0.0)
+    joint_weight = renewable_weight / num_risk_scenario
+    if joint_weight <= 0.0
+        return
+    end
+
+    if !(haskey(scenario_solution, "solution") && haskey(scenario_solution["solution"], "scarcity"))
+        return
+    end
+    scarcity = scenario_solution["solution"]["scarcity"]
+
+    push!(acc[:seen_daygroups], day_group_id)
+
+    pu_power_base = ctx[:pu_power_base]
+    current_year = ctx[:current_year]
+    ids_n = ctx[:ids_n]
+    ids_ht = ctx[:ids_ht]
+    num_days_by_d = ctx[:num_days_by_d]
+    day_idx_list = ctx[:day_idx_by_daygroup][day_group_id]
+    demand_list = ctx[:demand_list]
+
+    regional_eue = acc[:regional_eue]
+    regional_lolh = acc[:regional_lolh]
+    regional_max_consec = acc[:regional_max_consec]
+    regional_max_mwh = acc[:regional_max_mwh]
+    regional_max_mw = acc[:regional_max_mw]
+    dg_eue_regional = acc[:dg_eue_regional]
+    dg_daygroup_eue = acc[:dg_daygroup_eue]
+    dg_eue_by_hour = acc[:dg_eue_by_hour]
+    dg_neue_by_hour = acc[:dg_neue_by_hour]
+    hour_weight = acc[:hour_weight]
+
+    scenario_key = (day_group_id, joint_id)
+    sys_max_consec = acc[:sys_max_consec]
+    sys_max_mwh = acc[:sys_max_mwh]
+    sys_max_mw = acc[:sys_max_mw]
+
+    for n in ids_n
+        dg_key = (day_group_id, n)
+        dg_eue_hour_vec = dg_eue_by_hour[dg_key]
+        dg_neue_hour_vec = dg_neue_by_hour[dg_key]
+
+        # Per (bus, day_group, scenario) streak/severity state (resets each scenario).
+        consecutive_outage_hours = 0
+        cumulative_mwh_loss = 0.0
+        scenario_max_consec = 0
+        scenario_max_mwh = 0.0
+        scenario_max_mw = 0.0
+
+        for d in day_idx_list
+            num_days = num_days_by_d[d]
+            check_count = 1
+            for (h, t) in ids_ht
+                string_key = string("(", n, ", ", d, ", ", h, ", ", t, ", ", current_year, ")")
+                unserved_energy = haskey(scarcity, string_key) ? scarcity[string_key]["ens_ndhty"] * pu_power_base : 0.0
+
+                if unserved_energy > 0.0001
+                    weighted_unserved_energy = unserved_energy * num_days
+                    expected_unserved_energy = weighted_unserved_energy * joint_weight
+                    regional_eue[n] += expected_unserved_energy
+                    dg_daygroup_eue[dg_key] += expected_unserved_energy
+                    dg_eue_regional[dg_key] += expected_unserved_energy
+                    dg_eue_hour_vec[check_count] += expected_unserved_energy
+
+                    demand = demand_list[(n, d, h, t)]
+                    if demand > 0
+                        expected_neue_hourly = (expected_unserved_energy / demand) * 1000000
+                        dg_neue_hour_vec[check_count] += expected_neue_hourly
+                    end
+
+                    consecutive_outage_hours += 1
+                    cumulative_mwh_loss += unserved_energy
+                    scenario_max_mw = max(scenario_max_mw, unserved_energy)
+
+                    # Per-unique system outage hour weight; constant per key, overwrite-safe.
+                    hour_weight[(scenario_key, (d, h, t))] = num_days * joint_weight
+                    regional_lolh[n] += num_days * joint_weight
+                else
+                    scenario_max_consec = max(scenario_max_consec, consecutive_outage_hours)
+                    scenario_max_mwh = max(scenario_max_mwh, cumulative_mwh_loss)
+                    consecutive_outage_hours = 0
+                    cumulative_mwh_loss = 0.0
+                end
+
+                check_count += 1
+            end
+        end
+
+        scenario_max_consec = max(scenario_max_consec, consecutive_outage_hours)
+        scenario_max_mwh = max(scenario_max_mwh, cumulative_mwh_loss)
+
+        regional_max_consec[n] = max(regional_max_consec[n], scenario_max_consec)
+        regional_max_mwh[n] = max(regional_max_mwh[n], scenario_max_mwh)
+        regional_max_mw[n] = max(regional_max_mw[n], scenario_max_mw)
+
+        # System maxima; deterministic tie-break on smaller day_group_id.
+        if scenario_max_consec > sys_max_consec[1] || (scenario_max_consec == sys_max_consec[1] && scenario_max_consec > 0 && day_group_id < sys_max_consec[2])
+            sys_max_consec = (Float64(scenario_max_consec), day_group_id)
+        end
+        if scenario_max_mwh > sys_max_mwh[1] || (scenario_max_mwh == sys_max_mwh[1] && scenario_max_mwh > 0.0 && day_group_id < sys_max_mwh[2])
+            sys_max_mwh = (scenario_max_mwh, day_group_id)
+        end
+        if scenario_max_mw > sys_max_mw[1] || (scenario_max_mw == sys_max_mw[1] && scenario_max_mw > 0.0 && day_group_id < sys_max_mw[2])
+            sys_max_mw = (scenario_max_mw, day_group_id)
+        end
+    end
+
+    acc[:sys_max_consec] = sys_max_consec
+    acc[:sys_max_mwh] = sys_max_mwh
+    acc[:sys_max_mw] = sys_max_mw
+    return
+end
+
+# Write the finalized metrics from the accumulators into RA_Info["RA_metrics"], computing
+# NEUE ratios and systemwide reductions in sorted key order for run-to-run determinism.
+function _ra_finalize_metrics_from_accumulator!(am, RA_Info, ctx, acc)
+    ids_n = ctx[:ids_n]
+    ids_daygroup = ctx[:ids_daygroup]
+    num_ht = ctx[:num_ht]
+    bus_name_dict = ctx[:bus_name_dict]
+    regional_demand_list = ctx[:regional_demand_list]
+    regional_daygroup_demand = ctx[:regional_daygroup_demand]
+    daygroup_demand_list = ctx[:daygroup_demand_list]
+    total_system_demand = ctx[:total_system_demand]
+
+    # Initialize metric output dicts (same structure/descriptions as the serial pass).
+    description = "Expected Unserved Energy: Total expected energy (in MWh) that could not be supplied to demand, averaged over risk scenarios."
+    RA_Info["RA_metrics"]["EUE"] = initialize_RA_dict(am, ids_n; day_group_flag = true, description)
+    description = "Normalized Expected Unserved Energy: Expected Unserved Energy normalized by regional demand, expressed in parts per million (ppm)."
+    RA_Info["RA_metrics"]["NEUE"] = initialize_RA_dict(am, ids_n; day_group_flag = true, description)
+    description = "Loss of Load Hours: Total hours in a year where demand exceeds supply, averaged over risk scenarios."
+    RA_Info["RA_metrics"]["LOLH"] = initialize_RA_dict(am, ids_n; description)
+    description = "Loss of Load Expectation (days/year): Average expected number of days in a year when load exceeds generation capacity."
+    RA_Info["RA_metrics"]["LOLE"] = initialize_RA_dict(am, ids_n; description)
+    description = "Maximum number of consecutive hours with unserved energy in a given region or system."
+    RA_Info["RA_metrics"]["Max_Consecutive_Outage_Hours"] = initialize_RA_dict(am, ids_n; description)
+    description = "Maximum amount of energy (in MWh) that could not be served during a specific period."
+    RA_Info["RA_metrics"]["Max_MWh_Loss"] = initialize_RA_dict(am, ids_n; description)
+    description = "Maximum power loss (in MW) experienced during a specific period."
+    RA_Info["RA_metrics"]["Max_MW_Loss"] = initialize_RA_dict(am, ids_n; description)
+
+    regional_eue = acc[:regional_eue]
+    regional_lolh = acc[:regional_lolh]
+    regional_max_consec = acc[:regional_max_consec]
+    regional_max_mwh = acc[:regional_max_mwh]
+    regional_max_mw = acc[:regional_max_mw]
+    dg_eue_regional = acc[:dg_eue_regional]
+    dg_daygroup_eue = acc[:dg_daygroup_eue]
+    dg_eue_by_hour = acc[:dg_eue_by_hour]
+    dg_neue_by_hour = acc[:dg_neue_by_hour]
+    seen_daygroups = acc[:seen_daygroups]
+
+    # Regional write-back in ascending ids_n order.
+    for n in sort(ids_n)
+        bus_name = bus_name_dict[n]
+        regional_unserved_energy_MWh_count = regional_eue[n]
+
+        RA_Info["RA_metrics"]["LOLH"]["Annual"]["Regional"][bus_name] = regional_lolh[n]
+        RA_Info["RA_metrics"]["EUE"]["Annual"]["Regional"][bus_name] = regional_unserved_energy_MWh_count
+        RA_Info["RA_metrics"]["Max_Consecutive_Outage_Hours"]["Annual"]["Regional"][bus_name] = regional_max_consec[n]
+        RA_Info["RA_metrics"]["Max_MWh_Loss"]["Annual"]["Regional"][bus_name] = regional_max_mwh[n]
+        RA_Info["RA_metrics"]["Max_MW_Loss"]["Annual"]["Regional"][bus_name] = regional_max_mw[n]
+
+        if regional_demand_list[n] > 0
+            RA_Info["RA_metrics"]["NEUE"]["Annual"]["Regional"][bus_name] = (regional_unserved_energy_MWh_count / regional_demand_list[n]) * 1000000
+        end
+
+        for day_group_id in sort(ids_daygroup)
+            if !(day_group_id in seen_daygroups)
+                continue
+            end
+            dg_key = (day_group_id, n)
+            day_group_key = string(day_group_id)
+            day_group_eue = RA_Info["RA_metrics"]["EUE"]["Day Group"][day_group_key]
+            day_group_neue = RA_Info["RA_metrics"]["NEUE"]["Day Group"][day_group_key]
+
+            day_group_eue["Regional"][bus_name] += dg_eue_regional[dg_key]
+            eue_hour_vec = dg_eue_by_hour[dg_key]
+            neue_hour_vec = dg_neue_by_hour[dg_key]
+            for hc in 1:num_ht
+                day_group_eue["Regional_by_Hour"][bus_name][hc] += eue_hour_vec[hc]
+                day_group_neue["Regional_by_Hour"][bus_name][hc] += neue_hour_vec[hc]
+            end
+
+            daygroup_demand = regional_daygroup_demand[(n, day_group_id)]
+            if daygroup_demand > 0
+                day_group_neue["Regional"][bus_name] = (dg_daygroup_eue[dg_key] / daygroup_demand) * 1000000
+            else
+                day_group_neue["Regional"][bus_name] = 0.0
+            end
+        end
+    end
+
+    # EUE annual systemwide = sum over buses in ascending ids_n order.
+    annual_unserved_energy_MWh_count = 0.0
+    for n in sort(ids_n)
+        annual_unserved_energy_MWh_count += regional_eue[n]
+    end
+
+    # Systemwide LOLH: each unique (day_group,joint,hour) counted once, summed in sorted
+    # key order (per-key value is constant) for run-to-run determinism.
+    annual_unserved_energy_event_hours_count = 0.0
+    for k in sort!(collect(keys(acc[:hour_weight])))
+        annual_unserved_energy_event_hours_count += acc[:hour_weight][k]
+    end
+
+    system_max_consecutive_outage_hours = acc[:sys_max_consec][1]
+    day_group_id_max_consecutive_outages = acc[:sys_max_consec][2]
+    system_max_mwh_loss = acc[:sys_max_mwh][1]
+    day_group_id_max_mwh_loss = acc[:sys_max_mwh][2]
+    system_max_mw_loss = acc[:sys_max_mw][1]
+    day_group_id_max_mw_loss = acc[:sys_max_mw][2]
+
+    RA_Info["RA_metrics"]["LOLH"]["Annual"]["Systemwide"] = annual_unserved_energy_event_hours_count
+    RA_Info["RA_metrics"]["EUE"]["Annual"]["Systemwide"] = annual_unserved_energy_MWh_count
+
+    for day_group_id in ids_daygroup
+        for n in ids_n
+            RA_Info["RA_metrics"]["EUE"]["Day Group"][string(day_group_id)]["Systemwide"] += RA_Info["RA_metrics"]["EUE"]["Day Group"][string(day_group_id)]["Regional"][bus_name_dict[n]]
+        end
+    end
+
+    if total_system_demand > 0
+        RA_Info["RA_metrics"]["NEUE"]["Annual"]["Systemwide"] = (annual_unserved_energy_MWh_count / total_system_demand) * 1000000
+    else
+        RA_Info["RA_metrics"]["NEUE"]["Annual"]["Systemwide"] = 0.0
+    end
+
+    for day_group_id in ids_daygroup
+        daygroup_demand = daygroup_demand_list[day_group_id]
+        if daygroup_demand > 0
+            RA_Info["RA_metrics"]["NEUE"]["Day Group"][string(day_group_id)]["Systemwide"] = (RA_Info["RA_metrics"]["EUE"]["Day Group"][string(day_group_id)]["Systemwide"] / daygroup_demand) * 1000000
+        else
+            RA_Info["RA_metrics"]["NEUE"]["Day Group"][string(day_group_id)]["Systemwide"] = 0.0
+        end
+    end
+
+    RA_Info["RA_metrics"]["Max_Consecutive_Outage_Hours"]["Annual"]["Systemwide"] = system_max_consecutive_outage_hours
+    RA_Info["RA_metrics"]["Max_Consecutive_Outage_Hours"]["Annual"]["day_group_id"] = day_group_id_max_consecutive_outages
+    RA_Info["RA_metrics"]["Max_MWh_Loss"]["Annual"]["Systemwide"] = system_max_mwh_loss
+    RA_Info["RA_metrics"]["Max_MWh_Loss"]["Annual"]["day_group_id"] = day_group_id_max_mwh_loss
+    RA_Info["RA_metrics"]["Max_MW_Loss"]["Annual"]["Systemwide"] = system_max_mw_loss
+    RA_Info["RA_metrics"]["Max_MW_Loss"]["Annual"]["day_group_id"] = day_group_id_max_mw_loss
+
+    total_duration = 1.0 # years
+    num_hours = 8760 # total number of hours in a year
+    RA_Info["RA_metrics"]["LOLE"]["Annual"]["Systemwide"] = convert_LOLH_to_LOLE(RA_Info["RA_metrics"]["LOLH"]["Annual"]["Systemwide"], num_hours, total_duration)
+    for n in ids_n
+        RA_Info["RA_metrics"]["LOLE"]["Annual"]["Regional"][bus_name_dict[n]] = convert_LOLH_to_LOLE(RA_Info["RA_metrics"]["LOLH"]["Annual"]["Regional"][bus_name_dict[n]], num_hours, total_duration)
+    end
+
+    # Compact demand diagnostics for EUE/NEUE verification (mirror of the serial pass).
+    regional_demand_by_bus = Dict{String, Float64}()
+    regional_daygroup_demand_by_bus = Dict{String, Dict{String, Float64}}()
+    for n in ids_n
+        bus_name = bus_name_dict[n]
+        regional_demand_by_bus[bus_name] = get(regional_demand_list, n, 0.0)
+        by_day = Dict{String, Float64}()
+        for day_group_id in ids_daygroup
+            by_day[string(day_group_id)] = get(regional_daygroup_demand, (n, day_group_id), 0.0)
+        end
+        regional_daygroup_demand_by_bus[bus_name] = by_day
+    end
+    daygroup_demand = Dict{String, Float64}()
+    solved_scenarios_by_daygroup = Dict{String, Int}()
+    acc_solved = get(acc, :solved_scenarios_by_daygroup, Dict{String, Int}())
+    for day_group_id in ids_daygroup
+        day_key = string(day_group_id)
+        daygroup_demand[day_key] = get(daygroup_demand_list, day_group_id, 0.0)
+        solved_scenarios_by_daygroup[day_key] = get(acc_solved, day_key, 0)
+    end
+    RA_Info["system_info"]["demand"] = Dict{String, Any}(
+        "num_risk_scenario_setting" => ctx[:num_risk_scenario],
+        "total_system_demand_mwh" => total_system_demand,
+        "regional_demand_mwh" => regional_demand_by_bus,
+        "daygroup_demand_mwh" => daygroup_demand,
+        "regional_daygroup_demand_mwh" => regional_daygroup_demand_by_bus,
+        "solved_scenarios_by_daygroup" => solved_scenarios_by_daygroup
+    )
+
+    return RA_Info
+end
+
+
 function calculate_risk_metrics_ED!(am, RA_Info)
 
     if !haskey(RA_Info, "system_info")
         RA_Info["system_info"] = Dict{String, Any}()
     end
 
+    # Streaming path: dispatch pre-folded scenarios into accumulators (O(day-group) memory).
+    # Finalize directly, bypassing the RA_solutions-based pass.
+    if haskey(RA_Info, "RA_metric_accumulator") && haskey(RA_Info, "RA_metric_context")
+        ctx = RA_Info["RA_metric_context"]
+        acc = RA_Info["RA_metric_accumulator"]
+        RA_Info = _ra_finalize_metrics_from_accumulator!(am, RA_Info, ctx, acc)
+        delete!(RA_Info, "RA_metric_accumulator")
+        delete!(RA_Info, "RA_metric_context")
+        return RA_Info
+    end
+
     pu_power_base = am.setting["Simulation Setting"]["per_unit_base_value"]
-    
+
     num_risk_scenario = RA_Info["setting"]["num_risk_scenario"]
     renewable_scenario_weights = get(RA_Info["setting"], "renewable_scenario_weights", Dict{String, Float64}())
     filtered_joint_scenario_map = get(RA_Info["RA_reference_risk_data"], "filtered_joint_scenario_map", Dict{Int, Dict{Int, Dict{String, Any}}}())
@@ -6034,175 +6896,316 @@ function calculate_risk_metrics_ED!(am, RA_Info)
         end
     end
     
-    # Initialize weighted expectation counters across joint scenarios.
-    annual_unserved_energy_event_hours_count = 0.0
-    annual_unserved_energy_MWh_count = 0.0
-
-    # Track systemwide maxima and where they occur.
-    system_max_consecutive_outage_hours = 0.0
-    system_max_mwh_loss = 0.0
-    system_max_mw_loss = 0.0
-
-    # Initialize arrays to store the day_group_id for max losses
+    # Default day_group_id for each system maximum (used if no outage is ever recorded);
+    # the annual/system counters and maxima themselves are computed in the serial reduction below.
     day_group_id_max_consecutive_outages = 0
     day_group_id_max_mwh_loss = 0
     day_group_id_max_mw_loss = 0
 
-    # Prevent double counting system LOLH across buses within each solved joint scenario.
-    system_hour_counted = Dict{Tuple{Int, Int}, Set{Tuple{Int, Int, Int}}}()
-        
     # bus_name dict
     bus_name_dict = Dict{Int, String}()
     for n in ids_n
         bus_name = am.ref[:nw][0][:bus][n]["bus_i"]
         bus_name = isa(bus_name, String) ? bus_name : string(bus_name)  # make sure that bus_name is a string
 
-        bus_name_dict[n] = bus_name 
+        bus_name_dict[n] = bus_name
     end
-    
-    
-    for n in ids_n
 
-        regional_annual_unserved_energy_event_hours_count = 0.0
-        regional_unserved_energy_MWh_count = 0.0
+    # Parallelize the per-bus risk-metric accumulation. Buses are independent except for a
+    # few cross-bus reductions, so partition into contiguous chunks, accumulate into per-chunk
+    # local buffers (no shared RA_Info mutation inside tasks), then write back serially in
+    # chunk/ids_n order to preserve the committed serial results bit-for-bit where possible.
+    num_ht = length(ids_ht)
+    chunk_size = max(1, length(ids_n) ÷ Threads.nthreads())
+    chunk_ranges = collect(Iterators.partition(eachindex(ids_n), chunk_size))
+    num_chunks = length(chunk_ranges)
 
-        # Track maximum consecutive outage hours, max MW loss, and max MWh loss
-        regional_max_consecutive_outage_hours = 0
-        regional_max_mwh_loss = 0.0  # Track maximum cumulative MWh loss
-        regional_max_mw_loss = 0.0   # Track maximum instantaneous MW loss
+    # Per-chunk buffers (one slot per chunk; chunk c holds results for buses ids_n[chunk_ranges[c]]).
+    chunk_regional_eue = Vector{Dict{Int, Float64}}(undef, num_chunks)
+    chunk_regional_lolh = Vector{Dict{Int, Float64}}(undef, num_chunks)
+    chunk_regional_max_consec = Vector{Dict{Int, Int}}(undef, num_chunks)
+    chunk_regional_max_mwh = Vector{Dict{Int, Float64}}(undef, num_chunks)
+    chunk_regional_max_mw = Vector{Dict{Int, Float64}}(undef, num_chunks)
+    # Per-(day_group, bus) buffers, keyed by (day_group_id, n).
+    chunk_dg_eue_regional = Vector{Dict{Tuple{Int, Int}, Float64}}(undef, num_chunks)
+    chunk_dg_eue_by_hour = Vector{Dict{Tuple{Int, Int}, Vector{Float64}}}(undef, num_chunks)
+    chunk_dg_neue_by_hour = Vector{Dict{Tuple{Int, Int}, Vector{Float64}}}(undef, num_chunks)
+    chunk_dg_neue_regional = Vector{Dict{Tuple{Int, Int}, Float64}}(undef, num_chunks)
+    # Partial cross-bus state per chunk: unique outage-hour weights (value constant per key,
+    # overwrite-safe) plus the first-seen key order (to reproduce serial discovery-order summation
+    # in the single-chunk case) and the 3 system maxima.
+    chunk_hour_weight = Vector{Dict{Tuple{Tuple{Int, Int}, Tuple{Int, Int, Int}}, Float64}}(undef, num_chunks)
+    chunk_hour_order = Vector{Vector{Tuple{Tuple{Int, Int}, Tuple{Int, Int, Int}}}}(undef, num_chunks)
+    chunk_max_consec = Vector{Tuple{Float64, Int}}(undef, num_chunks)
+    chunk_max_mwh = Vector{Tuple{Float64, Int}}(undef, num_chunks)
+    chunk_max_mw = Vector{Tuple{Float64, Int}}(undef, num_chunks)
 
-        bus_name = bus_name_dict[n]
-        
-        for day_group_id in ids_daygroup
-            day_group_key = string(day_group_id)
-            if !haskey(RA_Info["RA_solutions"], day_group_key)
-                continue
-            end
+    @sync for c in 1:num_chunks
+        Threads.@spawn begin
+            # Chunk-local accumulators.
+            local_regional_eue = Dict{Int, Float64}()
+            local_regional_lolh = Dict{Int, Float64}()
+            local_regional_max_consec = Dict{Int, Int}()
+            local_regional_max_mwh = Dict{Int, Float64}()
+            local_regional_max_mw = Dict{Int, Float64}()
+            local_dg_eue_regional = Dict{Tuple{Int, Int}, Float64}()
+            local_dg_eue_by_hour = Dict{Tuple{Int, Int}, Vector{Float64}}()
+            local_dg_neue_by_hour = Dict{Tuple{Int, Int}, Vector{Float64}}()
+            local_dg_neue_regional = Dict{Tuple{Int, Int}, Float64}()
+            local_hour_weight = Dict{Tuple{Tuple{Int, Int}, Tuple{Int, Int, Int}}, Float64}()
+            local_hour_order = Vector{Tuple{Tuple{Int, Int}, Tuple{Int, Int, Int}}}()
 
-            day_group_solution = RA_Info["RA_solutions"][day_group_key]
-            day_group_eue = RA_Info["RA_metrics"]["EUE"]["Day Group"][day_group_key]
-            day_group_neue = RA_Info["RA_metrics"]["NEUE"]["Day Group"][day_group_key]
-            day_idx_list = am.ref[:nw][0][:repday_groups][day_group_id]["Day_Idx_List"]
-            daygroup_expected_unserved_energy = 0.0
+            local_max_consec_val = 0.0
+            local_max_consec_dg = 0
+            local_max_mwh_val = 0.0
+            local_max_mwh_dg = 0
+            local_max_mw_val = 0.0
+            local_max_mw_dg = 0
 
-            for joint_id in keys(day_group_solution)
-                if !haskey(filtered_joint_scenario_map, day_group_id) || !haskey(filtered_joint_scenario_map[day_group_id], joint_id)
-                    @aleaf_warn "Skipped RA metric accumulation for unexpected joint_id=$joint_id in day_group=$day_group_id"
-                    continue
-                end
+            for idx in chunk_ranges[c]
+                n = ids_n[idx]
 
-                joint_scenario = filtered_joint_scenario_map[day_group_id][joint_id]
-                renewable_scenario_id = joint_scenario["renewable_scenario_id"]
-                renewable_weight = get(renewable_scenario_weights, renewable_scenario_id, 0.0)
-                joint_weight = renewable_weight / num_risk_scenario
-                if joint_weight <= 0.0
-                    continue
-                end
+                regional_annual_unserved_energy_event_hours_count = 0.0
+                regional_unserved_energy_MWh_count = 0.0
 
-                scenario_solution = day_group_solution[joint_id]
-                if !(haskey(scenario_solution, "solution") && haskey(scenario_solution["solution"], "scarcity"))
-                    continue
-                end
+                # Track maximum consecutive outage hours, max MW loss, and max MWh loss
+                regional_max_consecutive_outage_hours = 0
+                regional_max_mwh_loss = 0.0  # Track maximum cumulative MWh loss
+                regional_max_mw_loss = 0.0   # Track maximum instantaneous MW loss
 
-                scarcity = scenario_solution["solution"]["scarcity"]
+                for day_group_id in ids_daygroup
+                    day_group_key = string(day_group_id)
+                    if !haskey(RA_Info["RA_solutions"], day_group_key)
+                        continue
+                    end
 
-                # Temporary counters for consecutive outages in this (bus, day-group, scenario).
-                consecutive_outage_hours = 0
-                cumulative_mwh_loss = 0.0
+                    day_group_solution = RA_Info["RA_solutions"][day_group_key]
+                    day_idx_list = am.ref[:nw][0][:repday_groups][day_group_id]["Day_Idx_List"]
+                    daygroup_expected_unserved_energy = 0.0
 
-                for d in day_idx_list
-                    num_days = parameter(am, 0, :repdays, "NumDays", d)
-                    check_count = 1
+                    # Chunk-local per-(day_group, bus) hourly accumulators (mirror of the shared vectors).
+                    dg_eue_by_hour_vec = zeros(num_ht)
+                    dg_neue_by_hour_vec = zeros(num_ht)
+                    dg_eue_regional_val = 0.0
 
-                    for (h, t) in ids_ht
-                        string_key = string("(", n, ", ", d, ", ", h, ", ", t, ", ", current_year, ")")
-                        unserved_energy = haskey(scarcity, string_key) ? scarcity[string_key]["ens_ndhty"] * pu_power_base : 0.0
-                        
-                        if unserved_energy > 0.0001 
-                            weighted_unserved_energy = unserved_energy * num_days
-                            # Accumulate annual and day-group expected unserved energy.
-                            expected_unserved_energy = weighted_unserved_energy * joint_weight
-                            annual_unserved_energy_MWh_count += expected_unserved_energy
-                            regional_unserved_energy_MWh_count += expected_unserved_energy
-                            daygroup_expected_unserved_energy += expected_unserved_energy
-                            day_group_eue["Regional"][bus_name] += expected_unserved_energy
-                            day_group_eue["Regional_by_Hour"][bus_name][check_count] += expected_unserved_energy
-
-                            demand = demand_list[(n, d, h, t)]
-                            if demand > 0
-                                # Keep hourly profile as ratio at each hour; day-group NEUE is set from ratio-of-totals later.
-                                expected_neue_hourly = (expected_unserved_energy / demand) * 1000000
-                                day_group_neue["Regional_by_Hour"][bus_name][check_count] += expected_neue_hourly
-                            end
-
-                            # Track outage streak and severity.
-                            consecutive_outage_hours += 1
-                            cumulative_mwh_loss += unserved_energy
-                            regional_max_mw_loss = max(regional_max_mw_loss, unserved_energy)
-
-                            # Count system LOLH once per scenario/day/hour across all buses.
-                            hour_key = (d, h, t)
-                            scenario_key = (day_group_id, joint_id)
-                            if !haskey(system_hour_counted, scenario_key)
-                                system_hour_counted[scenario_key] = Set{Tuple{Int, Int, Int}}()
-                            end
-                            if !(hour_key in system_hour_counted[scenario_key])
-                                push!(system_hour_counted[scenario_key], hour_key)
-                                annual_unserved_energy_event_hours_count += num_days * joint_weight
-                            end
-                            regional_annual_unserved_energy_event_hours_count += num_days * joint_weight
-
-                        else
-                            # No outage in this hour: close and reset the current streak.
-                            regional_max_consecutive_outage_hours = max(regional_max_consecutive_outage_hours, consecutive_outage_hours)
-                            regional_max_mwh_loss = max(regional_max_mwh_loss, cumulative_mwh_loss)
-                            consecutive_outage_hours = 0
-                            cumulative_mwh_loss = 0.0
+                    for joint_id in keys(day_group_solution)
+                        if !haskey(filtered_joint_scenario_map, day_group_id) || !haskey(filtered_joint_scenario_map[day_group_id], joint_id)
+                            @aleaf_warn "Skipped RA metric accumulation for unexpected joint_id=$joint_id in day_group=$day_group_id"
+                            continue
                         end
 
-                        check_count += 1
+                        joint_scenario = filtered_joint_scenario_map[day_group_id][joint_id]
+                        renewable_scenario_id = joint_scenario["renewable_scenario_id"]
+                        renewable_weight = get(renewable_scenario_weights, renewable_scenario_id, 0.0)
+                        joint_weight = renewable_weight / num_risk_scenario
+                        if joint_weight <= 0.0
+                            continue
+                        end
+
+                        scenario_solution = day_group_solution[joint_id]
+                        if !(haskey(scenario_solution, "solution") && haskey(scenario_solution["solution"], "scarcity"))
+                            continue
+                        end
+
+                        scarcity = scenario_solution["solution"]["scarcity"]
+
+                        # Temporary counters for consecutive outages in this (bus, day-group, scenario).
+                        consecutive_outage_hours = 0
+                        cumulative_mwh_loss = 0.0
+
+                        for d in day_idx_list
+                            num_days = parameter(am, 0, :repdays, "NumDays", d)
+                            check_count = 1
+
+                            for (h, t) in ids_ht
+                                string_key = string("(", n, ", ", d, ", ", h, ", ", t, ", ", current_year, ")")
+                                unserved_energy = haskey(scarcity, string_key) ? scarcity[string_key]["ens_ndhty"] * pu_power_base : 0.0
+
+                                if unserved_energy > 0.0001
+                                    weighted_unserved_energy = unserved_energy * num_days
+                                    # Accumulate annual and day-group expected unserved energy.
+                                    expected_unserved_energy = weighted_unserved_energy * joint_weight
+                                    regional_unserved_energy_MWh_count += expected_unserved_energy
+                                    daygroup_expected_unserved_energy += expected_unserved_energy
+                                    dg_eue_regional_val += expected_unserved_energy
+                                    dg_eue_by_hour_vec[check_count] += expected_unserved_energy
+
+                                    demand = demand_list[(n, d, h, t)]
+                                    if demand > 0
+                                        # Keep hourly profile as ratio at each hour; day-group NEUE is set from ratio-of-totals later.
+                                        expected_neue_hourly = (expected_unserved_energy / demand) * 1000000
+                                        dg_neue_by_hour_vec[check_count] += expected_neue_hourly
+                                    end
+
+                                    # Track outage streak and severity.
+                                    consecutive_outage_hours += 1
+                                    cumulative_mwh_loss += unserved_energy
+                                    regional_max_mw_loss = max(regional_max_mw_loss, unserved_energy)
+
+                                    # Record the per-unique-hour system weight; identical across buses, so overwrite-safe.
+                                    # Preserve first-seen order within the chunk for deterministic summation.
+                                    hour_key = (d, h, t)
+                                    scenario_key = (day_group_id, joint_id)
+                                    combined_key = (scenario_key, hour_key)
+                                    if !haskey(local_hour_weight, combined_key)
+                                        push!(local_hour_order, combined_key)
+                                    end
+                                    local_hour_weight[combined_key] = num_days * joint_weight
+                                    regional_annual_unserved_energy_event_hours_count += num_days * joint_weight
+
+                                else
+                                    # No outage in this hour: close and reset the current streak.
+                                    regional_max_consecutive_outage_hours = max(regional_max_consecutive_outage_hours, consecutive_outage_hours)
+                                    regional_max_mwh_loss = max(regional_max_mwh_loss, cumulative_mwh_loss)
+                                    consecutive_outage_hours = 0
+                                    cumulative_mwh_loss = 0.0
+                                end
+
+                                check_count += 1
+                            end
+                        end
+
+                        # Final flush if the last simulated hour ended inside an outage streak.
+                        regional_max_consecutive_outage_hours = max(regional_max_consecutive_outage_hours, consecutive_outage_hours)
+                        regional_max_mwh_loss = max(regional_max_mwh_loss, cumulative_mwh_loss)
+
+                        # Update chunk-local systemwide maxima and record where each max occurred.
+                        if regional_max_consecutive_outage_hours > local_max_consec_val
+                            local_max_consec_val = regional_max_consecutive_outage_hours
+                            local_max_consec_dg = day_group_id
+                        end
+                        if regional_max_mwh_loss > local_max_mwh_val
+                            local_max_mwh_val = regional_max_mwh_loss
+                            local_max_mwh_dg = day_group_id
+                        end
+                        if regional_max_mw_loss > local_max_mw_val
+                            local_max_mw_val = regional_max_mw_loss
+                            local_max_mw_dg = day_group_id
+                        end
+                    end
+
+                    # Buffer per-(day_group, bus) accumulations for serial write-back.
+                    local_dg_eue_regional[(day_group_id, n)] = dg_eue_regional_val
+                    local_dg_eue_by_hour[(day_group_id, n)] = dg_eue_by_hour_vec
+                    local_dg_neue_by_hour[(day_group_id, n)] = dg_neue_by_hour_vec
+
+                    # Day-group regional NEUE as ratio-of-totals for consistency with systemwide NEUE.
+                    daygroup_demand = regional_daygroup_demand[(n, day_group_id)]
+                    if daygroup_demand > 0
+                        local_dg_neue_regional[(day_group_id, n)] = (daygroup_expected_unserved_energy / daygroup_demand) * 1000000
+                    else
+                        local_dg_neue_regional[(day_group_id, n)] = 0.0
                     end
                 end
 
-                # Final flush if the last simulated hour ended inside an outage streak.
-                regional_max_consecutive_outage_hours = max(regional_max_consecutive_outage_hours, consecutive_outage_hours)
-                regional_max_mwh_loss = max(regional_max_mwh_loss, cumulative_mwh_loss)
-
-                # Update systemwide maxima and record where each max occurred.
-                if regional_max_consecutive_outage_hours > system_max_consecutive_outage_hours
-                    system_max_consecutive_outage_hours = regional_max_consecutive_outage_hours
-                    day_group_id_max_consecutive_outages = day_group_id
-                end
-                if regional_max_mwh_loss > system_max_mwh_loss
-                    system_max_mwh_loss = regional_max_mwh_loss
-                    day_group_id_max_mwh_loss = day_group_id
-                end
-                if regional_max_mw_loss > system_max_mw_loss
-                    system_max_mw_loss = regional_max_mw_loss
-                    day_group_id_max_mw_loss = day_group_id
-                end
+                local_regional_eue[n] = regional_unserved_energy_MWh_count
+                local_regional_lolh[n] = regional_annual_unserved_energy_event_hours_count
+                local_regional_max_consec[n] = regional_max_consecutive_outage_hours
+                local_regional_max_mwh[n] = regional_max_mwh_loss
+                local_regional_max_mw[n] = regional_max_mw_loss
             end
 
-            # Day-group regional NEUE as ratio-of-totals for consistency with systemwide NEUE.
-            daygroup_demand = regional_daygroup_demand[(n, day_group_id)]
-            if daygroup_demand > 0
-                day_group_neue["Regional"][bus_name] = (daygroup_expected_unserved_energy / daygroup_demand) * 1000000
-            else
-                day_group_neue["Regional"][bus_name] = 0.0
+            chunk_regional_eue[c] = local_regional_eue
+            chunk_regional_lolh[c] = local_regional_lolh
+            chunk_regional_max_consec[c] = local_regional_max_consec
+            chunk_regional_max_mwh[c] = local_regional_max_mwh
+            chunk_regional_max_mw[c] = local_regional_max_mw
+            chunk_dg_eue_regional[c] = local_dg_eue_regional
+            chunk_dg_eue_by_hour[c] = local_dg_eue_by_hour
+            chunk_dg_neue_by_hour[c] = local_dg_neue_by_hour
+            chunk_dg_neue_regional[c] = local_dg_neue_regional
+            chunk_hour_weight[c] = local_hour_weight
+            chunk_hour_order[c] = local_hour_order
+            chunk_max_consec[c] = (local_max_consec_val, local_max_consec_dg)
+            chunk_max_mwh[c] = (local_max_mwh_val, local_max_mwh_dg)
+            chunk_max_mw[c] = (local_max_mw_val, local_max_mw_dg)
+        end
+    end
+
+    # Serial, deterministic write-back: ascending chunk index, then ids_n order within chunk.
+    for c in 1:num_chunks
+        for idx in chunk_ranges[c]
+            n = ids_n[idx]
+            bus_name = bus_name_dict[n]
+
+            regional_unserved_energy_MWh_count = chunk_regional_eue[c][n]
+
+            # Save the regional LOLH, EUE, NEUE, Max MWh, and Max MW loss metrics
+            RA_Info["RA_metrics"]["LOLH"]["Annual"]["Regional"][bus_name] = chunk_regional_lolh[c][n]
+            RA_Info["RA_metrics"]["EUE"]["Annual"]["Regional"][bus_name] = regional_unserved_energy_MWh_count
+            RA_Info["RA_metrics"]["Max_Consecutive_Outage_Hours"]["Annual"]["Regional"][bus_name] = chunk_regional_max_consec[c][n]
+            RA_Info["RA_metrics"]["Max_MWh_Loss"]["Annual"]["Regional"][bus_name] = chunk_regional_max_mwh[c][n]
+            RA_Info["RA_metrics"]["Max_MW_Loss"]["Annual"]["Regional"][bus_name] = chunk_regional_max_mw[c][n]
+
+            if regional_demand_list[n] > 0
+                RA_Info["RA_metrics"]["NEUE"]["Annual"]["Regional"][bus_name] = (regional_unserved_energy_MWh_count / regional_demand_list[n]) * 1000000
+            end
+
+            # Per-(day_group, bus) write-back into the shared nested dicts.
+            for day_group_id in ids_daygroup
+                day_group_key = string(day_group_id)
+                if !haskey(RA_Info["RA_solutions"], day_group_key)
+                    continue
+                end
+                dg_key = (day_group_id, n)
+                day_group_eue = RA_Info["RA_metrics"]["EUE"]["Day Group"][day_group_key]
+                day_group_neue = RA_Info["RA_metrics"]["NEUE"]["Day Group"][day_group_key]
+
+                day_group_eue["Regional"][bus_name] += chunk_dg_eue_regional[c][dg_key]
+                eue_hour_vec = chunk_dg_eue_by_hour[c][dg_key]
+                neue_hour_vec = chunk_dg_neue_by_hour[c][dg_key]
+                for hc in 1:num_ht
+                    day_group_eue["Regional_by_Hour"][bus_name][hc] += eue_hour_vec[hc]
+                    day_group_neue["Regional_by_Hour"][bus_name][hc] += neue_hour_vec[hc]
+                end
+                day_group_neue["Regional"][bus_name] = chunk_dg_neue_regional[c][dg_key]
             end
         end
+    end
 
-        # Save the regional LOLH, EUE, NEUE, Max MWh, and Max MW loss metrics
-        RA_Info["RA_metrics"]["LOLH"]["Annual"]["Regional"][bus_name] = regional_annual_unserved_energy_event_hours_count
-        RA_Info["RA_metrics"]["EUE"]["Annual"]["Regional"][bus_name] = regional_unserved_energy_MWh_count
-        RA_Info["RA_metrics"]["Max_Consecutive_Outage_Hours"]["Annual"]["Regional"][bus_name] = regional_max_consecutive_outage_hours
-        RA_Info["RA_metrics"]["Max_MWh_Loss"]["Annual"]["Regional"][bus_name] = regional_max_mwh_loss
-        RA_Info["RA_metrics"]["Max_MW_Loss"]["Annual"]["Regional"][bus_name] = regional_max_mw_loss
-
-        if regional_demand_list[n] > 0
-            RA_Info["RA_metrics"]["NEUE"]["Annual"]["Regional"][bus_name] = (regional_unserved_energy_MWh_count / regional_demand_list[n]) * 1000000
+    # EUE (annual, systemwide) = sum over buses of regional EUE in ascending ids_n order.
+    annual_unserved_energy_MWh_count = 0.0
+    for c in 1:num_chunks
+        for idx in chunk_ranges[c]
+            annual_unserved_energy_MWh_count += chunk_regional_eue[c][ids_n[idx]]
         end
+    end
 
+    # Systemwide LOLH: each unique outage hour contributes once. Sum in first-seen order across
+    # chunks (ascending chunk, first-seen within chunk) deduping already-counted hours; this
+    # reproduces serial discovery-order summation exactly in the single-chunk case and is fully
+    # deterministic for any chunk count (per-key value is constant, so the dedup winner is value-identical).
+    annual_unserved_energy_event_hours_count = 0.0
+    counted_hours = Set{Tuple{Tuple{Int, Int}, Tuple{Int, Int, Int}}}()
+    for c in 1:num_chunks
+        local_order = chunk_hour_order[c]
+        local_weight = chunk_hour_weight[c]
+        for k in local_order
+            if !(k in counted_hours)
+                push!(counted_hours, k)
+                annual_unserved_energy_event_hours_count += local_weight[k]
+            end
+        end
+    end
+
+    # Reduce the 3 system maxima across chunks in ascending chunk order with strict >
+    # (earliest bus in ids_n wins ties — matches serial).
+    system_max_consecutive_outage_hours = 0.0
+    system_max_mwh_loss = 0.0
+    system_max_mw_loss = 0.0
+    for c in 1:num_chunks
+        if chunk_max_consec[c][1] > system_max_consecutive_outage_hours
+            system_max_consecutive_outage_hours = chunk_max_consec[c][1]
+            day_group_id_max_consecutive_outages = chunk_max_consec[c][2]
+        end
+        if chunk_max_mwh[c][1] > system_max_mwh_loss
+            system_max_mwh_loss = chunk_max_mwh[c][1]
+            day_group_id_max_mwh_loss = chunk_max_mwh[c][2]
+        end
+        if chunk_max_mw[c][1] > system_max_mw_loss
+            system_max_mw_loss = chunk_max_mw[c][1]
+            day_group_id_max_mw_loss = chunk_max_mw[c][2]
+        end
     end
 
     # Update system-wide reliability metrics
@@ -6710,15 +7713,15 @@ function get_gen_outage_data(ALEAF_setting, case_id; RA_input::Dict{String,<:Any
     @aleaf_info "[ALEAF RA Model]: Update Network Data for RA"
 
     risk_scenario_dict = Dict{Int, Any}()
-    risk_scenario_dict, RA_Info["RA_reference_risk_data"]["filtered_joint_scenario_map"] = generate_and_filter_risk_scenarios(RA_ALEAF_setting, RA_Info, ALEAF_model_instance; RA_input)
+    # force_in_memory: this entry serializes the in-memory dict below, so it keeps sampling
+    # in-memory (generate_outage_samples' own distributed branch still parallelizes the work)
+    # rather than the coarse-partials path.
+    risk_scenario_dict, RA_Info["RA_reference_risk_data"]["filtered_joint_scenario_map"] = generate_and_filter_risk_scenarios(RA_ALEAF_setting, RA_Info, ALEAF_model_instance; RA_input, force_in_memory=true)
     @aleaf_info "[ALEAF RA Model]: Risk Sampling Completed"
 
     # Save generated outage data so the same RA_input can be reused later.
     if save_output == true
         output_path = ALEAF_model_instance.ref[:nw][0][:output_path]
-        outage_cache_path = joinpath(output_path, "RA_outage_cache")
-        risk_scenario_dict_int64 = Dict{Int64, Any}(Int64(k) => v for (k, v) in risk_scenario_dict)
-        _write_risk_scenario_cache!(outage_cache_path, risk_scenario_dict_int64; prefix="day")
         ra_input_output_path = joinpath(output_path, "RA_input_fixed_risk_sample.jld2")
         filtered_joint_scenario_map = RA_Info["RA_reference_risk_data"]["filtered_joint_scenario_map"]
         @save ra_input_output_path risk_scenario_dict filtered_joint_scenario_map
@@ -6756,6 +7759,11 @@ function update_solver_setting!(RA_ALEAF_setting)
                 end
                 if param == "CPXPARAM_SolutionType"
                     RA_ALEAF_setting["CPLEX Setting"][setting_id]["Flag"] = false
+                end
+                # Dual simplex (warm-startable) beats barrier for the many tiny near-identical RA LPs.
+                if param == "CPX_PARAM_LPMETHOD"
+                    RA_ALEAF_setting["CPLEX Setting"][setting_id]["Value"] = 2
+                    RA_ALEAF_setting["CPLEX Setting"][setting_id]["Flag"] = true
                 end
             end
         end

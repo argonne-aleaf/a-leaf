@@ -8328,8 +8328,9 @@ function build_solve_LCO_GTEP_expansion_multi_round_direct(ALEAF_setting, case_i
     end
 
     # build LCO GEP model instance (expansion mode)
+    @aleaf_info "[ALEAF LC_GTEP Expansion Model]: Building GTEP model instance (expansion mode)"
     build_LCO_GTEP_expansion_mode_instance!(ALEAF_model_instance, decomp_group; GTEP_multi_round_info_data = GTEP_multi_round_info, ref_expansion_result=LP_expansion_solution)
-    @aleaf_info "[ALEAF LC_GTEP Expansion Model]: Build GTEP model instance (expansion mode)"
+    @aleaf_info "[ALEAF LC_GTEP Expansion Model]: Built GTEP model instance (expansion mode)"
 
     # Export ALEAF_model_instance model
     if ALEAF_setting["Simulation Setting"]["export_model_lp_expansion_flag"] == true
@@ -8583,6 +8584,7 @@ function solve_LC_GTEP_direct_multi_round(ALEAF_model_instance::Abstract_ALEAF_M
     output = Dict{String, Any}()
     
     # Solve ALEAF LC_GEP Expansion Model
+    @aleaf_info string("[ALEAF LC_GTEP Expansion Model]: Solving with ", get(solver_setting, "solver_name", "solver"))
     output[string(decomp_group)] = solve_model_GTEP!(JuMP_model, decomp_group, solution_list, solver_setting; iteration, PH_flag=false)
     @aleaf_info "[ALEAF LC_GTEP Expansion Model]: Solved."
 

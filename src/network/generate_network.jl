@@ -2958,12 +2958,18 @@ function get_repday_groups_data!(network_data::Dict{String, <:Any}, ALEAF_settin
     end
     network_data["time_series_data"]["hydro_water_value_df"] = DataFrame(CSV.File(joinpath(ALEAF_setting["data_location_timeseries"], water_value_file_name)))
 
-    # Add repday reference for easier access (without data)
+    # Add repday reference for easier access (metadata only)
     network_data["repdays"] = deepcopy(network_data["planning_stages"]["1"]["repdays"])
 
-    # check and update stochastic timeseries data 
+    # check and update stochastic timeseries data
     if (LC_GTEP_model_type == "expansion")
         replace_stochastic_time_series_data!(ALEAF_setting, network_data, case_id, ALEAF_setting["data_location"])
+    end
+
+    # Keep this reference metadata-only: the per-repday ["data"] tensors live in planning_stages,
+    # so don't duplicate them. Stripped after replace_stochastic_time_series_data! whose schema probe reads repdays[*]["data"].
+    for (_rk, _rentry) in network_data["repdays"]
+        _rentry isa AbstractDict && delete!(_rentry, "data")
     end
 
 end
